@@ -37,12 +37,15 @@ class RoundRobinNode final : public TaskSchedulerNode {
 
  protected:
   int NextTaskId() final {
-    int n_tasks = this->tasks.size();
+    int n_tasks = this->tasks_.size();
+    for (int i = 0; i < n_tasks; ++i) {
+      this->TouchTask(i);
+    }
     for (int i = 0; i < n_tasks; ++i) {
       task_id = (task_id + 1) % n_tasks;
-      TuneContext task = tasks[task_id];
-      if (!task->is_stopped) {
-        if (IsTaskRunning(task_id)) {
+      TaskRecordNode* task = this->tasks_[task_id].get();
+      if (!task->is_terminated) {
+        if (task->runner_futures.defined()) {
           JoinRunningTask(task_id);
         }
         return task_id;
@@ -52,15 +55,9 @@ class RoundRobinNode final : public TaskSchedulerNode {
   }
 };
 
-TaskScheduler TaskScheduler::RoundRobin(Array<TuneContext> tasks,  //
-                                        Builder builder,           //
-                                        Runner runner,             //
-                                        Database database) {
+TaskScheduler TaskScheduler::RoundRobin(PackedFunc logger) {
   ObjectPtr<RoundRobinNode> n = make_object<RoundRobinNode>();
-  n->tasks = tasks;
-  n->builder = builder;
-  n->runner = runner;
-  n->database = database;
+  n->logger = logger;
   n->task_id = -1;
   return TaskScheduler(n);
 }

@@ -15,8 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Maps object type to its constructor"""
+"""Maps object type index to its constructor"""
 cdef list OBJECT_TYPE = []
+"""Maps object type to its type index"""
+cdef dict OBJECT_INDEX = {}
 
 def _register_object(int index, object cls):
     """register object class"""
@@ -28,7 +30,11 @@ def _register_object(int index, object cls):
     while len(OBJECT_TYPE) <= index:
         OBJECT_TYPE.append(None)
     OBJECT_TYPE[index] = cls
+    OBJECT_INDEX[cls] = index
 
+def _get_object_type_index(object cls):
+    """get the type index of object class"""
+    return OBJECT_INDEX.get(cls)
 
 cdef inline object make_ret_object(void* chandle):
     global OBJECT_TYPE
@@ -38,7 +44,7 @@ cdef inline object make_ret_object(void* chandle):
     cdef object handle
     object_type = OBJECT_TYPE
     handle = ctypes_handle(chandle)
-    CALL(TVMObjectGetTypeIndex(chandle, &tindex))
+    CHECK_CALL(TVMObjectGetTypeIndex(chandle, &tindex))
 
     if tindex < len(OBJECT_TYPE):
         cls = OBJECT_TYPE[tindex]
@@ -54,7 +60,17 @@ cdef inline object make_ret_object(void* chandle):
         obj = _CLASS_OBJECT.__new__(_CLASS_OBJECT)
 
     (<ObjectBase>obj).chandle = chandle
+
+    # Handle return values that must be converted from the TVM object
+    # to a python native object.  This should be used in cases where
+    # subclassing the python native object is forbidden.  For example,
+    # `runtime.BoxBool` cannot be a subclass of `bool`, as `bool` does
+    # not allow any subclasses.
+    # if hasattr(obj, '__into_pynative_object__'):
+    #     return obj.__into_pynative_object__)
+
     return obj
+    # return obj.__into_pynative_object__()
 
 
 class PyNativeObject:
@@ -101,7 +117,7 @@ cdef class ObjectBase:
             self._set_handle(value)
 
     def __dealloc__(self):
-        CALL(TVMObjectFree(self.chandle))
+        CHECK_CALL(TVMObjectFree(self.chandle))
 
     def __init_handle_by_constructor__(self, fconstructor, *args):
         """Initialize the handle by calling constructor function.

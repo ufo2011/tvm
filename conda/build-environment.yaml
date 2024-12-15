@@ -25,9 +25,11 @@ channels:
 
 # The packages to install to the environment
 dependencies:
-  - conda-build
+  - python=3.9
+  - conda < 24.9.0
+  - conda-build < 24.9.0
   - git
-  - llvmdev ==10.0.0
+  - llvmdev >=11
   - numpy
   - pytest
   - cython

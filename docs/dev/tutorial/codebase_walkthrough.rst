@@ -93,11 +93,14 @@ This function is mapped to the C++ function in ``include/tvm/schedule.h``.
 
 ``Schedule`` and ``Stage`` are defined in ``tvm/python/te/schedule.py``, ``include/tvm/te/schedule.h``, and ``src/te/schedule/schedule_ops.cc``.
 
-To keep it simple, we call ``tvm.build(...)`` on the default schedule created by ``create_schedule()`` function above.
+To keep it simple, we call ``tvm.build(...)`` on the default schedule created by ``create_schedule()`` function above, and we must add necessary thread bindings to make it runnable on GPU.
 
 ::
 
    target = "cuda"
+   bx, tx = s[C].split(C.op.axis[0], factor=64)
+   s[C].bind(bx, tvm.te.thread_axis("blockIdx.x"))
+   s[C].bind(tx, tvm.te.thread_axis("threadIdx.x"))
    fadd = tvm.build(s, [A, B, C], target)
 
 ``tvm.build()``, defined in ``python/tvm/driver/build_module.py``, takes a schedule, input and output ``Tensor``, and a target, and returns a :py:class:`tvm.runtime.Module` object. A :py:class:`tvm.runtime.Module` object contains a compiled function which can be invoked with function call syntax.
@@ -121,7 +124,7 @@ Lowering is done by ``tvm.lower()`` function, defined in ``python/tvm/build_modu
       stmt = schedule.ScheduleOps(sch, bounds)
       ...
 
-Bound inference is the process where all loop bounds and sizes of intermediate buffers are inferred. If you target the CUDA backend and you use shared memory, its required minimum size is automatically determined here. Bound inference is implemented in ``src/te/schedule/bound.cc``, ``src/te/schedule/graph.cc`` and ``src/te/schedule/message_passing.cc``. For more information on how bound inference works, see :ref:`dev-InferBound-Pass`.
+Bound inference is the process where all loop bounds and sizes of intermediate buffers are inferred. If you target the CUDA backend and you use shared memory, its required minimum size is automatically determined here. Bound inference is implemented in ``src/te/schedule/bound.cc``, ``src/te/schedule/graph.cc`` and ``src/te/schedule/message_passing.cc``.
 
 
 ``stmt``, which is the output of ``ScheduleOps()``, represents an initial loop nest structure. If you have applied ``reorder`` or ``split`` primitives to your schedule, then the initial loop nest already reflects those changes. ``ScheduleOps()`` is defined in ``src/te/schedule/schedule_ops.cc``.

@@ -28,6 +28,7 @@ Here, we demonstrate how to load and run models quantized by PyTorch, MXNet, and
 Once loaded, we can run compiled, quantized models on any hardware TVM supports.
 """
 
+
 #################################################################################
 # First, necessary imports
 from PIL import Image
@@ -161,7 +162,7 @@ with torch.no_grad():
 #
 # You would see operators specific to quantization such as
 # qnn.quantize, qnn.dequantize, qnn.requantize, and qnn.conv2d etc.
-input_name = "input"  # the input name can be be arbitrary for PyTorch frontend.
+input_name = "input"  # the input name can be arbitrary for PyTorch frontend.
 input_shapes = [(input_name, (1, 3, 224, 224))]
 mod, params = relay.frontend.from_pytorch(script_module, input_shapes)
 # print(mod) # comment in to see the QNN IR dump
@@ -175,7 +176,8 @@ mod, params = relay.frontend.from_pytorch(script_module, input_shapes)
 #
 # Under the hood, quantization specific operators are lowered to a sequence of
 # standard Relay operators before compilation.
-tvm_result, rt_mod = run_tvm_model(mod, params, input_name, inp, target="llvm")
+target = "llvm"
+tvm_result, rt_mod = run_tvm_model(mod, params, input_name, inp, target=target)
 
 ##########################################################################
 # Compare the output labels

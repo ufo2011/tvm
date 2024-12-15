@@ -18,6 +18,7 @@
 import tempfile
 
 import numpy as np
+import pytest
 
 from tvm import auto_scheduler, relay
 from tvm.contrib import graph_executor
@@ -26,7 +27,16 @@ import tvm.testing
 from test_auto_scheduler_task_extraction import get_network
 
 
-def tune_network(network, target):
+network = tvm.testing.parameter(
+    "mlp",
+    pytest.param("winograd-test", marks=pytest.mark.xfail(reason="Flaky unit test")),
+)
+
+
+@tvm.testing.requires_cuda
+def test_tuning_cuda(network):
+    target = "cuda"
+
     # Extract tasks
     mod, params = get_network(network)
     target = tvm.target.Target(target)
@@ -36,7 +46,7 @@ def tune_network(network, target):
         log_file = fp.name
 
         # Tuning
-        measure_ctx = auto_scheduler.LocalRPCMeasureContext(timeout=60)
+        measure_ctx = auto_scheduler.LocalRPCMeasureContext(timeout=60, device=0)
         tuner = auto_scheduler.TaskScheduler(tasks, task_weights, callbacks=[])
         tune_option = auto_scheduler.TuningOptions(
             num_measure_trials=100,
@@ -55,6 +65,19 @@ def tune_network(network, target):
                 opt_level=3, config={"relay.backend.use_auto_scheduler": True}
             ):
                 lib = relay.build(mod, target=target, params=params)
+
+        # Also test that multiple log files can be loaded.
+        with auto_scheduler.ApplyHistoryBest([log_file, log_file]) as best:
+            assert isinstance(
+                best, auto_scheduler.dispatcher.ApplyHistoryBest
+            ), "Unable to load multiple log files jointly."
+
+        # Confirm iterables can be directly loaded.
+        loaded_recs = auto_scheduler.dispatcher.load_records(log_file)
+        with auto_scheduler.ApplyHistoryBest(iter(loaded_recs)) as best:
+            assert isinstance(
+                best, auto_scheduler.dispatcher.ApplyHistoryBest
+            ), "Unable to ingest logs from an interator."
 
         # Sample a schedule when missing
         with auto_scheduler.ApplyHistoryBestOrSample(None, num_measure=2):
@@ -91,11 +114,5 @@ def tune_network(network, target):
         tvm.testing.assert_allclose(actual_output2, expected_output, rtol=1e-4, atol=1e-4)
 
 
-@tvm.testing.requires_cuda
-def test_tuning_cuda():
-    tune_network("mlp", "cuda")
-    tune_network("winograd-test", "cuda")
-
-
 if __name__ == "__main__":
-    test_tuning_cuda()
+    tvm.testing.main()

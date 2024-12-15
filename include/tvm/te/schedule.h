@@ -29,6 +29,7 @@
 #include <tvm/te/tensor.h>
 #include <tvm/te/tensor_intrin.h>
 #include <tvm/tir/expr.h>
+#include <tvm/tir/index_map.h>
 
 #include <string>
 #include <unordered_map>
@@ -61,8 +62,9 @@ class Stage : public ObjectRef {
   /*!
    * \brief create a new schedule for op.
    * \param op The operator in the schedule
+   * \param sch The schedule which current stage belongs to
    */
-  explicit Stage(Operation op);
+  explicit Stage(Operation op, const ScheduleNode* sch);
   /*!
    * \brief access the internal node container
    * \return the pointer to the internal node container
@@ -129,10 +131,14 @@ class Stage : public ObjectRef {
    * \param factor The split factor of the loop.
    * \param p_outer The result outer domain
    * \param p_inner The result inner domain.
+   * \param disable_predication If enabled, don't create a predicate for guarding the
+   * loop. This can be useful when splitting with scalable factors that the schedule writer
+   * knows are divisible by the loop bound.
+   * Warning: enabling this feature may result in incorrect code generation if not used carefully.
    * \return reference to self.
    */
-  TVM_DLL Stage& split(IterVar parent, PrimExpr factor, IterVar* p_outer,
-                       IterVar* p_inner);  // NOLINT(*)
+  TVM_DLL Stage& split(IterVar parent, PrimExpr factor, IterVar* p_outer, IterVar* p_inner,
+                       bool disable_predication = false);  // NOLINT(*)
   /*!
    * \brief Split the iteration with given number of parts.
    *
@@ -140,10 +146,14 @@ class Stage : public ObjectRef {
    * \param nparts The number of parts in the outer domain.
    * \param p_outer The result outer domain.
    * \param p_inner The result inner domain.
+   * \param disable_predication If enabled, don't create a predicate for guarding the
+   * loop. This can be useful when splitting with scalable factors that the schedule writer
+   * knows are divisible by the loop bound.
+   * Warning: enabling this feature may result in incorrect code generation if not used carefully.
    * \return reference to self.
    */
   TVM_DLL Stage& split_by_nparts(IterVar parent, PrimExpr nparts, IterVar* p_outer,
-                                 IterVar* p_inner);  // NOLINT(*)
+                                 IterVar* p_inner, bool disable_predication = false);  // NOLINT(*)
   /*!
    * \brief Fuse the inner outer domain to the target
    * \param outer The outer domain to be fused.
@@ -257,6 +267,41 @@ class Stage : public ObjectRef {
    */
   TVM_DLL Stage& rolling_buffer();  // NOLINT(*)
   /*!
+   * \brief Defines a layout transformation to be applied to the buffer.
+   *
+   * The map from initial_index to final_index must be an
+   * invertible affine transformation.
+   *
+   * \param initial_indices An array of variables to represent a
+   * value's location in the tensor, using the pre-transformation
+   * layout.  These variables are used as binding occurrences to
+   * represent the initial indices when applying the initial->final
+   * mapping, and should not occur elsewhere in the
+   * Schedule. (i.e. Pass in newly constructed variables, not the
+   * initial IterVar::var)
+   *
+   * \param final_indices An array of expressions, giving the
+   * value's location in the tensor, using the post-transformation layout.
+   * Expressions should be in terms of the variables given in
+   * initial_indices.
+   *
+   * \param out_iter_vars An optional output location for the updated
+   * loop iteration variables.
+   *
+   * \return reference to self
+   */
+  TVM_DLL Stage& transform_layout(const Array<Var>& initial_indices,
+                                  const Array<PrimExpr>& final_indices,
+                                  Array<IterVar>* out_iter_vars = nullptr);
+  /*! \brief Defines separators between groups of axes.
+   *
+   * Used to define `BufferNode::axis_separators`, which has
+   * additional details.
+   *
+   * \param axis_separators A list of axis separators.
+   */
+  TVM_DLL Stage& set_axis_separators(const Array<IntImm>& axis_separators);
+  /*!
    * \brief whether the stage has been scheduled.
    * \return whether the stage has been scheduled.
    */
@@ -285,7 +330,6 @@ class Schedule : public ObjectRef {
   /*!
    * \brief Create a schedule for array of ops(and their dependencies).
    * \param ops The ops to be scheduled.
-   * \return sch The created Schedule.
    */
   TVM_DLL explicit Schedule(Array<Operation> ops);
   /*!
@@ -328,7 +372,7 @@ class Schedule : public ObjectRef {
                             const Array<Operation>& readers);
   /*!
    * \brief Create a cache write tensor for producing tensor.
-   *  The the tensor will take over body of original tensor op.
+   *  The tensor will take over body of original tensor op.
    *
    *  This function can be used to do data layout transformation.
    *  If there is a split/fuse/reorder on the data parallel axis of tensor
@@ -345,7 +389,7 @@ class Schedule : public ObjectRef {
   TVM_DLL Array<Tensor> cache_write(const Array<Tensor>& tensor, const std::string& scope);
   /*!
    * \brief Create a cache write tensor for producing tensor.
-   *  The the tensor will take over body of original tensor op.
+   *  The tensor will take over body of original tensor op.
    *
    *  This function can be used to do data layout transformation.
    *  If there is a split/fuse/reorder on the data parallel axis of tensor
@@ -410,6 +454,26 @@ class Schedule : public ObjectRef {
 };
 
 /*!
+ * \brief Context helper to collect debug information of Schedule.
+ *
+ *  Attach With<ScheduleContext>(schedule_instance, primitive_name)
+ *  inside function body of schedule primitives to collect the
+ *  snapshot of schedule status and corresponding primitive name
+ */
+class ScheduleContext {
+ private:
+  friend class With<ScheduleContext>;
+  ScheduleContext(const ScheduleNode* sch_node, String current_primitive_name);
+  void EnterWithScope();
+  void ExitWithScope();
+
+  /*! \brief Schedule instance to store information for debug */
+  Schedule sch_;
+  /*! \brief String representing which primitive has been applied to sch_ */
+  String current_primitive_name_;
+};
+
+/*!
  * \brief The schedule relation between IterVars
  *  can be Split, Fuse.
  */
@@ -466,9 +530,27 @@ class StageNode : public Object {
    *  while origin_op remains fixed.
    */
   Operation origin_op;
-  /*! \brief All the nodes in the iter var */
+  /*! \brief All the nodes in the iter var
+   *
+   * Each element of all_iter_vars represents an iteration variable
+   * that may appear within this stage's computation.  Any element
+   * of `all_iter_vars` that is in `leaf_iter_vars` represents a
+   * variable that is directly defined and usable within the stage's
+   * computation.  All other elements of `all_iter_vars` represent
+   * variables whose value must be computed from the variables in
+   * `leaf_iter_vars`.  (e.g. Support index k has been split by
+   * ``ko, ki = s.split(k, factor=4)``.  ko and ki will appear in
+   * `leaf_iter_vars`, while k will not, and must be computed as
+   * `4*ko + ki`.
+   */
   Array<IterVar> all_iter_vars;
-  /*! \brief The current active leaf iter vars in the stage. */
+  /*! \brief The current active leaf iter vars in the stage.
+   *
+   * Each element of leaf_iter_vars will either be replaced with the
+   * bound index (e.g. threadIdx.x), or will be expanded into a loop
+   * over the variable's extent.  `leaf_iter_vars` is a subset of
+   * `all_iter_vars`.
+   */
   Array<IterVar> leaf_iter_vars;
   /*!
    * \brief Specify threads to be launched at the stage.
@@ -492,6 +574,8 @@ class StageNode : public Object {
   IterVar attach_ivar;
   /*! \brief The stage this node attaches to */
   Stage attach_stage;
+  /*! \brief The schedule current stage is attached to */
+  const ScheduleNode* attach_sch;
   /*! \brief The thread storage scope level of the stage */
   std::string scope;
   /*! \brief Whether this is an output stage */
@@ -500,6 +584,14 @@ class StageNode : public Object {
   bool double_buffer{false};
   /*! \brief Whether apply rolling buffer optimization to this stage */
   bool rolling_buffer{false};
+  /*! \brief Layout transformations to be applied onto the stage's tensors. */
+  Array<IndexMap> layout_transforms;
+  /*! \brief List of axes after which to divide physical axes.
+   *
+   * Used to populate `BufferNode::axis_separators`, which has
+   * additional details.
+   */
+  Array<IntImm> axis_separators;
   /*!
    * \brief The parent group of the current stage.
    *  The stage cannot be assigned to stages outside the group.
@@ -522,6 +614,8 @@ class StageNode : public Object {
     v->Visit("scope", &scope);
     v->Visit("is_output", &is_output);
     v->Visit("double_buffer", &double_buffer);
+    v->Visit("layout_transforms", &layout_transforms);
+    v->Visit("axis_separators", &axis_separators);
     v->Visit("group", &group);
     v->Visit("num_child_stages", &num_child_stages);
   }
@@ -551,12 +645,30 @@ class ScheduleNode : public Object {
    *  This is created on demand and can be invalidated.
    */
   std::unordered_map<const Object*, Stage> op2stage_cache_;
+  /*!
+   * \brief list of all transformed schedules
+   * User can display the optimization strategy via TEDD step by step to check
+   * the order and effect of primitives. Set "te.keep_schedule_record" in
+   * PassContext config as true to enable recording.
+   */
+  Array<Schedule> schedule_record;
+  /*!
+   * \brief list of all applied primitive names.
+   */
+  Array<String> primitive_record;
+  /*!
+   * \brief Flag to keep schedule record or not.
+   */
+  Optional<Bool> keep_schedule_record;
 
   void VisitAttrs(AttrVisitor* v) {
     v->Visit("outputs", &outputs);
     v->Visit("stages", &stages);
     v->Visit("groups", &groups);
     v->Visit("stage_map", &stage_map);
+    v->Visit("schedule_record", &schedule_record);
+    v->Visit("primitive_record", &primitive_record);
+    v->Visit("keep_schedule_record", &keep_schedule_record);
   }
 
   /*! \brief Initialize temp cache. */
@@ -657,6 +769,8 @@ class SplitNode : public IterVarRelationNode {
   PrimExpr factor;
   /*! \brief Number of parts, only factor or nparts can be given */
   PrimExpr nparts;
+  /*! \brief Whether to disable generation of predication. */
+  bool disable_predication;
 
   void VisitAttrs(AttrVisitor* v) {
     v->Visit("parent", &parent);
@@ -664,6 +778,7 @@ class SplitNode : public IterVarRelationNode {
     v->Visit("inner", &inner);
     v->Visit("factor", &factor);
     v->Visit("nparts", &nparts);
+    v->Visit("disable_predication", &disable_predication);
   }
 
   static constexpr const char* _type_key = "Split";
@@ -676,7 +791,8 @@ class SplitNode : public IterVarRelationNode {
  */
 class Split : public IterVarRelation {
  public:
-  TVM_DLL Split(IterVar parent, IterVar outer, IterVar inner, PrimExpr factor, PrimExpr nparts);
+  TVM_DLL Split(IterVar parent, IterVar outer, IterVar inner, PrimExpr factor, PrimExpr nparts,
+                bool disable_predication);
 
   TVM_DEFINE_OBJECT_REF_METHODS(Split, IterVarRelation, SplitNode);
 };
@@ -769,6 +885,61 @@ class Singleton : public IterVarRelation {
   TVM_DLL explicit Singleton(IterVar iter);
 
   TVM_DEFINE_OBJECT_REF_METHODS(Singleton, IterVarRelation, SingletonNode);
+};
+
+/*!
+ * \brief Transform iterator according to some arbitrary expression.
+ */
+class TransformNode : public IterVarRelationNode {
+ public:
+  /*! \brief The loop variables that were replaced by the transformation.
+   *
+   * Prior to applying a layout transformation, these represent the
+   * loops to iterate over a tensor as it is being computed, following
+   * a row-major traversal of the tensor's original shape in the
+   * compute definition.
+   */
+  Array<IterVar> original_variables;
+
+  /*! \brief The variables generated by the transformation.
+   *
+   * After to applying a layout transformation, these represent the
+   * loops to iterate over a tensor as it is being computed, following
+   * a row-major traversal of the transformed shape of the tensor.
+   */
+  Array<IterVar> transformed_variables;
+
+  /*! \brief Map from the original variables to the transformed variables.
+   *
+   * Used to determine iterator ranges over the transformed variables.
+   */
+  IndexMap forward_transformation;
+
+  /*! \brief Map from transformed variables to the original variables
+   *
+   * Used to rewrite expressions containing the original loop iterators
+   * in terms of the transformed loop iterators.
+   */
+  IndexMap inverse_transformation;
+
+  void VisitAttrs(AttrVisitor* v) {
+    v->Visit("original_variables", &original_variables);
+    v->Visit("transformed_variables", &transformed_variables);
+    v->Visit("forward_transformation", &forward_transformation);
+    v->Visit("inverse_transformation", &inverse_transformation);
+  }
+
+  static constexpr const char* _type_key = "Transform";
+  TVM_DECLARE_FINAL_OBJECT_INFO(TransformNode, IterVarRelationNode);
+};
+
+class Transform : public IterVarRelation {
+ public:
+  TVM_DLL explicit Transform(Array<IterVar> original_variables,
+                             Array<IterVar> transformed_variables, IndexMap forward_transformation,
+                             IndexMap inverse_transformation);
+
+  TVM_DEFINE_OBJECT_REF_METHODS(Transform, IterVarRelation, TransformNode);
 };
 
 /*! \brief Container for specialization conditions. */

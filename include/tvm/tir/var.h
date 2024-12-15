@@ -28,6 +28,7 @@
 #include <tvm/node/node.h>
 #include <tvm/runtime/data_type.h>
 
+#include <functional>
 #include <string>
 
 namespace tvm {
@@ -38,7 +39,7 @@ namespace tir {
  *
  * A variable is uniquely identified by its address.
  *
- * Each variable is only binded once in the following nodes:
+ * Each variable is only bound once in the following nodes:
  * - Allocate
  * - For
  * - Let
@@ -52,7 +53,7 @@ class VarNode : public PrimExprNode {
    */
   String name_hint;
   /*!
-   * \brief type annotaion of the variable.
+   * \brief type annotation of the variable.
    *
    * It is an optional field that provides a refined type of the variable than dtype.
    *
@@ -104,6 +105,12 @@ class Var : public PrimExpr {
    */
   TVM_DLL explicit Var(String name_hint, Type type_annotation, Span span = Span());
   /*!
+   * \brief Make a new copy of var with same type, but a different nam
+   * \param name The new name to be used.
+   * \return the new Var copy
+   */
+  TVM_DLL Var copy_with_name(const String& name) const;
+  /*!
    * \brief Make a new copy of var with same type, append suffix
    * \param suffix The suffix to be appended.
    * \return the new Var copy
@@ -152,6 +159,13 @@ class SizeVar : public Var {
    */
   TVM_DLL explicit SizeVar(String name_hint = "s", DataType t = DataType::Int(32),
                            Span span = Span());
+  /*!
+   * \brief Constructor which provides a more detailed type annotation.
+   * \param name_hint variable name.
+   * \param type_annotation The type annotation.
+   * \param span The location of this object in the source code.
+   */
+  TVM_DLL explicit SizeVar(String name_hint, Type type_annotation, Span span = Span());
   /*!
    * \brief Get pointer to the internal value.
    * \return the corresponding Variable.
@@ -241,6 +255,8 @@ enum IterVarType : int {
 /*!
  * \brief An iteration variable representing an iteration
  *  over a one dimensional interval.
+ *
+ *  The dtype of the extent of the `dom` of the IterVar must match the dtype of the internal Var.
  */
 class IterVarNode : public Object {
  public:
@@ -255,7 +271,7 @@ class IterVarNode : public Object {
   IterVarType iter_type;
   /*!
    * \brief additional tag on the iteration variable,
-   *  set this if this is binded already to a known thread tag.
+   *  set this if this is bound already to a known thread tag.
    */
   String thread_tag;
   /*!
@@ -293,6 +309,8 @@ class IterVarNode : public Object {
 /*!
  * \brief Iteration Variable,
  *  represents an iteration over an integer interval.
+ *
+ *  The dtype of the extent of the `dom` of the IterVar must match the dtype of the internal Var.
  */
 class IterVar : public ObjectRef {
  public:
@@ -335,4 +353,33 @@ inline const char* IterVarType2String(IterVarType t) {
 }
 }  // namespace tir
 }  // namespace tvm
+
+/* \brief Allow tir.Var as key in STL tables
+ *
+ * For most TIR expressions, it would be ambiguous whether the
+ * expression should follow reference equality or structural equality.
+ * This is not the case for variables, which do not contain nested
+ * internal structure, and are frequently used as keys in lookup
+ * tables.
+ *
+ * Providing `std::hash` and `std::equal_to` specializations for
+ * `tir::Var` allows it to be used as a key in STL tables.  For
+ * `PrimExpr`, the user must specify the type of equality used
+ * (e.g. `std::unordered_set<T, StructuralHash, StructuralEqual>` or
+ * `std::unordered_set<T, ObjectPtrHash, ObjectPtrEqual>`).
+ */
+template <>
+struct std::hash<tvm::tir::Var> {
+  std::size_t operator()(const tvm::tir::Var& var) const {
+    return tvm::runtime::ObjectPtrHash()(var);
+  }
+};
+
+template <>
+struct std::equal_to<tvm::tir::Var> {
+  bool operator()(const tvm::tir::Var& var_a, const tvm::tir::Var& var_b) const {
+    return tvm::runtime::ObjectPtrEqual()(var_a, var_b);
+  }
+};
+
 #endif  // TVM_TIR_VAR_H_

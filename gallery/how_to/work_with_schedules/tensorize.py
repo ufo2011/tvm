@@ -34,6 +34,7 @@ and usage of tensorize instead of providing an efficient solution.
 """
 from __future__ import absolute_import, print_function
 
+
 import tvm
 from tvm import te
 import tvm.testing
@@ -311,8 +312,6 @@ tvm.testing.assert_allclose(c.numpy(), np.dot(a, b.T), rtol=1e-3)
 # Tensorize provides a way for users to get fully optimized schedule via micro-kernels.
 # For example, INT8 quantization on Intel CPUs uses tensorization
 # to invoke AVX instruction directly.
-# It also enables TVM to compile to ASICs -
-# checkout :ref:`vta-index` for details.
 # We also demonstrates how to use inline assembly importing,
 # which helps users inject asm easily into the schedule.
 #

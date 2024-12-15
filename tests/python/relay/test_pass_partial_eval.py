@@ -17,6 +17,7 @@
 
 import numpy as np
 import tvm
+import tvm.testing
 from tvm import relay
 from tvm.relay.prelude import Prelude
 from tvm.relay import op, create_executor, transform
@@ -72,7 +73,7 @@ def test_tuple():
     f = Function([x], body, None, [t])
     expected = relay.Function([x], x, None, [t])
     expected = run_opt_pass(expected, transform.InferType())
-    assert tvm.ir.structural_equal(dcpe(f), expected)
+    tvm.ir.assert_structural_equal(dcpe(f), expected)
 
 
 def test_const_inline():
@@ -80,7 +81,7 @@ def test_const_inline():
     d = Var("d", t)
     double = Function([d], d + d)
     orig = double(const(4.0))
-    assert tvm.ir.structural_equal(dcpe(orig), const(8.0))
+    tvm.ir.assert_structural_equal(dcpe(orig), const(8.0))
 
 
 def test_ref():
@@ -95,7 +96,7 @@ def test_ref():
     expected = run_opt_pass(Function([d], d * d), transform.InferType())
     # TODO(mbs): Revisit once DCE eliminates dead writes.
     actual = dcpe(square, ignore_impurity=True)
-    assert tvm.ir.structural_equal(actual, expected)
+    tvm.ir.assert_structural_equal(actual, expected)
 
 
 def test_empty_ad():
@@ -108,7 +109,7 @@ def test_empty_ad():
     g = dcpe(f, grad=True, ignore_impurity=True)
     expected = Function([d], Tuple([d, Tuple([op.ones_like(d)])]))
     expected = run_opt_pass(expected, transform.InferType())
-    assert tvm.ir.structural_equal(g, expected)
+    tvm.ir.assert_structural_equal(g, expected)
 
 
 def test_ad():
@@ -184,7 +185,7 @@ def test_head_cons():
     f = Function([x], body, None, [t])
     res = dcpe(f, mod)
     expected_mod = tvm.IRModule.from_expr(Function([x], x, t, [t]))
-    assert tvm.ir.structural_equal(res, expected_mod["main"])
+    tvm.ir.assert_structural_equal(res, expected_mod["main"])
 
 
 def test_map():
@@ -204,7 +205,7 @@ def test_map():
     expected = mod["main"]
     orig = Function([], orig)
     res = dcpe(orig, mod=mod)
-    assert tvm.ir.structural_equal(res.body, expected.body)
+    tvm.ir.assert_structural_equal(res.body, expected.body)
 
 
 def test_loop():
@@ -219,7 +220,7 @@ def test_loop():
     expected = mod["main"].body
     call = Function([], loop(const(1)))
     res = dcpe(call, mod=mod)
-    assert tvm.ir.structural_equal(res.body, expected)
+    tvm.ir.assert_structural_equal(res.body, expected)
 
 
 def test_swap_loop():
@@ -234,7 +235,7 @@ def test_swap_loop():
     prog = loop(make_nat_expr(p, 1), make_nat_expr(p, 2))
     res = Function([], prog)
     res = dcpe(res, mod=mod)
-    assert tvm.ir.structural_equal(prog, res.body)
+    tvm.ir.assert_structural_equal(prog, res.body)
 
 
 def test_abs_diff():
@@ -256,7 +257,7 @@ def test_abs_diff():
     orig = diff(make_nat_expr(p, 7), make_nat_expr(p, 3))
     orig = Function([], orig)
     res = dcpe(orig, mod=mod)
-    assert tvm.ir.structural_equal(res.body, make_nat_expr(p, 4))
+    tvm.ir.assert_structural_equal(res.body, make_nat_expr(p, 4))
 
 
 def test_match_nat_id():
@@ -273,7 +274,7 @@ def test_match_nat_id():
     orig = nat_id(make_nat_expr(p, 3))
     orig = Function([], orig)
     res = dcpe(orig, mod=mod)
-    assert tvm.ir.structural_equal(res.body, make_nat_expr(p, 3))
+    tvm.ir.assert_structural_equal(res.body, make_nat_expr(p, 3))
 
 
 def test_nat_id():
@@ -288,7 +289,7 @@ def test_nat_id():
     orig = nat_id(make_nat_expr(p, 3))
     orig = Function([], orig)
     res = dcpe(orig, mod=mod)
-    assert tvm.ir.structural_equal(res.body, make_nat_expr(p, 3))
+    tvm.ir.assert_structural_equal(res.body, make_nat_expr(p, 3))
 
 
 def test_global_match_nat_id():
@@ -302,7 +303,7 @@ def test_global_match_nat_id():
     orig = Match(make_nat_expr(p, 3), [z_case, s_case])
     orig = Function([], orig)
     res = dcpe(orig, mod=mod)
-    assert tvm.ir.structural_equal(res.body, make_nat_expr(p, 3))
+    tvm.ir.assert_structural_equal(res.body, make_nat_expr(p, 3))
 
 
 def test_double():
@@ -313,7 +314,7 @@ def test_double():
     orig = double(make_nat_expr(p, 3))
     orig = Function([], orig)
     res = dcpe(orig, mod=mod)
-    assert tvm.ir.structural_equal(res.body, make_nat_expr(p, 6))
+    tvm.ir.assert_structural_equal(res.body, make_nat_expr(p, 6))
 
 
 def test_concat():
@@ -350,7 +351,4 @@ def test_tuple_match():
 
 
 if __name__ == "__main__":
-    import sys
-    import pytest
-
-    sys.exit(pytest.main([__file__] + sys.argv[1:]))
+    tvm.testing.main()

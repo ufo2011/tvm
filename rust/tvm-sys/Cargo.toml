@@ -45,11 +45,9 @@ use-openmp = []
 use-relay-debug = []
 use-rtti = []
 use-mscv-mt = []
-use-micro = []
 use-install-dev = []
 hide-private-symbols = []
 use-fallback-stl-map = []
-use-ethosn = []
 use-index-default-i64 = []
 use-tf-tvmdsoop = []
 use-byodt-posit = []
@@ -64,7 +62,6 @@ use-rocblas = []
 use-sort = []
 use-nnpack = []
 use-random = []
-use-micro-standalone-runtime = []
 use-cpp-rpc = []
 use-tflite = []
 use-coreml = []
@@ -85,4 +82,4 @@ enumn = "^0.1"
 [build-dependencies]
 bindgen = { version="0.57", default-features = false, features = ["runtime"] }
 anyhow = "^1.0"
-tvm-build = "0.2.1"
+tvm-build = "0.2.4"
