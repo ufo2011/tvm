@@ -65,8 +65,8 @@ def pool_grad(
     padding,
     pool_type,
     ceil_mode=False,
-    layout="NCHW",
     count_include_pad=True,
+    layout="NCHW",
 ):
     """Gradient of pooling on height and width dimension of data.
        It decides the height and width dimension according to the layout string,
@@ -99,6 +99,9 @@ def pool_grad(
     ceil_mode : bool
         Whether to use ceil when calculating output size.
 
+    count_include_pad: bool
+        Whether include padding in the calculation when pool_type is 'avg'
+
     layout: string
         Layout of the input data.
         The layout is supposed to be composed of upper cases, lower cases and numbers,
@@ -108,8 +111,6 @@ def pool_grad(
         [batch_size, channel, height, width, channel_block],
         in which channel_block=16 is a split of dimension channel.
 
-    count_include_pad: bool
-        Whether include padding in the calculation when pool_type is 'avg'
 
     Returns
     -------
@@ -168,6 +169,13 @@ def adaptive_pool(data, output_size, pool_type, layout="NCHW"):
     return cpp.nn.adaptive_pool(data, output_size, POOL_TYPE_CODE[pool_type], layout)
 
 
+def adaptive_pool1d(data, output_size, pool_type, layout="NCW"):
+    """Perform pooling on three dimensional data.
+    See the two dimensional version above for details.
+    """
+    return cpp.nn.adaptive_pool1d(data, output_size, POOL_TYPE_CODE[pool_type], layout)
+
+
 def adaptive_pool3d(data, output_size, pool_type, layout="NCDHW"):
     """Perform pooling on three dimensional data.
     See the two dimensional version above for details.
@@ -204,6 +212,9 @@ def pool1d(
 
     stride : list/tuple of one int or int
         Stride size, [stride_width]
+
+    dilation: list/tuple of two ints
+        Dilation size, [dilation_height, dilation_width]
 
     padding : list/tuple of two ints
         Pad size, [pad_left, pad_right]
@@ -282,6 +293,9 @@ def pool2d(
     stride : list/tuple of two ints
         Stride size, [stride_height, stride_width]
 
+    dilation: list/tuple of two ints
+        Dilation size, [dilation_height, dilation_width]
+
     padding : list/tuple of four ints
         Pad size, [pad_top, pad_left, pad_bottom, pad_right]]
 
@@ -350,6 +364,9 @@ def pool3d(
 
     stride : list/tuple of three ints
         Stride size, [stride_depth, stride_height, stride_width]
+
+    dilation: list/tuple of two ints
+        Dilation size, [dilation_height, dilation_width]
 
     padding : list/tuple of six ints
         Pad size, [pad_front, pad_top, pad_left, pad_back, pad_bottom, pad_right]

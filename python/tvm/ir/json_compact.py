@@ -57,6 +57,120 @@ def create_updater(node_map, from_ver, to_ver):
     return _updater
 
 
+def create_updater_16_to_17():
+    """
+    Create an update to upgrade json from v0.16 to v0.17
+
+    Returns
+    -------
+    fupdater : function
+        The updater function
+    """
+
+    def _update_predicate_argument(item, nodes):
+        null_value_idx = 0
+        null_value = nodes[null_value_idx]
+        assert str(null_value) == "{'type_key': ''}", f"Expected a null value but got {null_value}"
+        item["attrs"]["predicate"] = str(null_value_idx)
+        return item
+
+    node_map = {
+        "tir.BufferLoad": _update_predicate_argument,
+        "tir.BufferStore": _update_predicate_argument,
+    }
+
+    return create_updater(node_map, "0.16", "0.17")
+
+
+def create_updater_15_to_16():
+    """
+    Create an update to upgrade json from v0.15 to v0.16
+
+    Returns
+    -------
+    fupdater : function
+        The updater function
+    """
+
+    def _update_lanes_obj(item, nodes):
+        lanes = item["attrs"]["lanes"]
+        new_idx = len(nodes)
+        item["attrs"]["lanes"] = str(new_idx)
+        lanes_node = {
+            "type_key": "IntImm",
+            "attrs": {"dtype": "int32", "span": "0", "value": lanes},
+        }
+        nodes.append(lanes_node)
+        return item
+
+    node_map = {"tir.Ramp": _update_lanes_obj, "tir.Broadcast": _update_lanes_obj}
+
+    return create_updater(node_map, "0.15", "0.16")
+
+
+def create_updater_13_to_14():
+    """Create an update to upgrade json from v0.13 to v0.14 for TVM Unity"""
+
+    def _update_vdevice(item, _):
+        if "vdevice" not in item["attrs"]:
+            item["attrs"]["vdevice"] = "0"
+        return item
+
+    node_map = {
+        "relax.TensorStructInfo": _update_vdevice,
+    }
+
+    return create_updater(node_map, "0.13", "0.14")
+
+
+def create_updater_08_to_09():
+    """
+    Create an update to upgrade json from v0.8 to v0.9
+
+    Returns
+    -------
+    fupdater : function
+        The updater function
+    """
+
+    def _initialize_virtual_device(item, _):
+        if "virtual_device_" not in item["attrs"]:
+            item["attrs"]["virtual_device_"] = "0"
+        return item
+
+    node_map = {
+        # Base IR
+        "GlobalVar": _initialize_virtual_device,
+        "relay.Var": _initialize_virtual_device,
+        "relay.Function": _initialize_virtual_device,
+        "relay.Tuple": _initialize_virtual_device,
+        "relay.Call": _initialize_virtual_device,
+        "relay.Let": _initialize_virtual_device,
+        "relay.If": _initialize_virtual_device,
+        "relay.TupleGetItem": _initialize_virtual_device,
+        "relay.RefCreate": _initialize_virtual_device,
+        "relay.RefRead": _initialize_virtual_device,
+        "relay.RefWrite": _initialize_virtual_device,
+        "relay.Match": _initialize_virtual_device,
+        "relay.Constant": _initialize_virtual_device,
+    }
+
+    return create_updater(node_map, "0.8", "0.9")
+
+
+def create_updater_07_to_08():
+    """Create an update to upgrade json from v0.7 to v0.8"""
+
+    def _initialize_module_attributes(item, _):
+        assert item["type_key"] == "IRModule", "Only initialize the attributes for IRModules"
+        if "attrs" not in item["attrs"]:
+            item["attrs"]["attrs"] = "0"
+        return item
+
+    node_map = {"IRModule": _initialize_module_attributes}
+    return create_updater(node_map, "0.7", "0.8")
+
+
 def create_updater_06_to_07():
     """Create an update to upgrade json from v0.6 to v0.7
 
@@ -105,7 +219,7 @@ def create_updater_06_to_07():
             val = jdata["nodes"][root_idx]
             sidx = len(nodes)
             nodes.append(val)
-            item["attrs"][key] = "%d" % sidx
+            item["attrs"][key] = f"{sidx}"
             return item
 
         return _convert
@@ -127,7 +241,7 @@ def create_updater_06_to_07():
         "relay.IncompleteType": _rename("IncompleteType"),
         "relay.TypeRelation": _rename("TypeRelation"),
         "relay.TypeCall": _rename("TypeCall"),
-        "relay.Constructor": [_update_from_std_str("name_hint")],
+        "relay.Constructor": _update_from_std_str("name_hint"),
         "relay.Module": _rename("IRModule"),
         "relay.SourceName": _rename("SourceName"),
         "relay.Span": _rename("Span"),
@@ -143,43 +257,41 @@ def create_updater_06_to_07():
         "Variable": [_update_tir_var("tir.Var"), _update_from_std_str("name")],
         "SizeVar": [_update_tir_var("tir.SizeVar"), _update_from_std_str("name")],
         "StringImm": [_rename("tir.StringImm"), _update_from_std_str("value")],
-        "Cast": [_rename("tir.Cast")],
-        "Add": [_rename("tir.Add")],
-        "Sub": [_rename("tir.Sub")],
-        "Mul": [_rename("tir.Mul")],
-        "Div": [_rename("tir.Div")],
-        "Mod": [_rename("tir.Mod")],
-        "FloorDiv": [_rename("tir.FloorDiv")],
-        "FloorMod": [_rename("tir.FloorMod")],
-        "Min": [_rename("tir.Min")],
-        "Max": [_rename("tir.Max")],
-        "EQ": [_rename("tir.EQ")],
-        "NE": [_rename("tir.NE")],
-        "LT": [_rename("tir.LT")],
-        "LE": [_rename("tir.LE")],
-        "GT": [_rename("tir.GT")],
-        "GE": [_rename("tir.GE")],
-        "And": [_rename("tir.And")],
-        "Or": [_rename("tir.Or")],
-        "Not": [_rename("tir.Not")],
-        "Select": [_rename("tir.Select")],
-        "Load": [_rename("tir.Load")],
-        "BufferLoad": [_rename("tir.BufferLoad")],
-        "Ramp": [_rename("tir.Ramp")],
-        "Broadcast": [_rename("tir.Broadcast")],
-        "Shuffle": [_rename("tir.Shuffle")],
+        "Cast": _rename("tir.Cast"),
+        "Add": _rename("tir.Add"),
+        "Sub": _rename("tir.Sub"),
+        "Mul": _rename("tir.Mul"),
+        "Div": _rename("tir.Div"),
+        "Mod": _rename("tir.Mod"),
+        "FloorDiv": _rename("tir.FloorDiv"),
+        "FloorMod": _rename("tir.FloorMod"),
+        "Min": _rename("tir.Min"),
+        "Max": _rename("tir.Max"),
+        "EQ": _rename("tir.EQ"),
+        "NE": _rename("tir.NE"),
+        "LT": _rename("tir.LT"),
+        "LE": _rename("tir.LE"),
+        "GT": _rename("tir.GT"),
+        "GE": _rename("tir.GE"),
+        "And": _rename("tir.And"),
+        "Or": _rename("tir.Or"),
+        "Not": _rename("tir.Not"),
+        "Select": _rename("tir.Select"),
+        "BufferLoad": _rename("tir.BufferLoad"),
+        "Ramp": _rename("tir.Ramp"),
+        "Broadcast": _rename("tir.Broadcast"),
+        "Shuffle": _rename("tir.Shuffle"),
         "Call": [_rename("tir.Call"), _update_from_std_str("name")],
-        "Let": [_rename("tir.Let")],
-        "Any": [_rename("tir.Any")],
-        "LetStmt": [_rename("tir.LetStmt")],
-        "AssertStmt": [_rename("tir.AssertStmt")],
-        "Store": [_rename("tir.Store")],
-        "BufferStore": [_rename("tir.BufferStore")],
-        "BufferRealize": [_rename("tir.BufferRealize")],
-        "Allocate": [_rename("tir.Allocate")],
-        "IfThenElse": [_rename("tir.IfThenElse")],
-        "Evaluate": [_rename("tir.Evaluate")],
-        "Prefetch": [_rename("tir.Prefetch")],
+        "Let": _rename("tir.Let"),
+        "Any": _rename("tir.Any"),
+        "LetStmt": _rename("tir.LetStmt"),
+        "AssertStmt": _rename("tir.AssertStmt"),
+        "BufferStore": _rename("tir.BufferStore"),
+        "BufferRealize": _rename("tir.BufferRealize"),
+        "Allocate": _rename("tir.Allocate"),
+        "IfThenElse": _rename("tir.IfThenElse"),
+        "Evaluate": _rename("tir.Evaluate"),
+        "Prefetch": _rename("tir.Prefetch"),
         "AttrStmt": [_rename("tir.AttrStmt"), _update_from_std_str("attr_key")],
         "Layout": [_rename("tir.Layout"), _update_from_std_str("name")],
         "Buffer": [
@@ -205,9 +317,31 @@ def upgrade_json(json_str):
         The updated version.
     """
     data = json.loads(json_str)
-    from_version = data["attrs"]["tvm_version"]
-    if from_version.startswith("0.6"):
+
+    def _from_version(data):
+        return data["attrs"]["tvm_version"]
+
+    if _from_version(data).startswith("0.6"):
         data = create_updater_06_to_07()(data)
-    else:
-        raise ValueError("Cannot update from version %s" % from_version)
+    if _from_version(data).startswith("0.7"):
+        data = create_updater_07_to_08()(data)
+    if _from_version(data).startswith("0.8"):
+        data = create_updater_08_to_09()(data)
+    if _from_version(data).startswith("0.9"):
+        data = create_updater({}, "0.9", "0.10")(data)
+    if _from_version(data).startswith("0.10"):
+        data = create_updater({}, "0.10", "0.11")(data)
+    if _from_version(data).startswith("0.11"):
+        data = create_updater({}, "0.11", "0.12")(data)
+    if _from_version(data).startswith("0.12"):
+        data = create_updater({}, "0.12", "0.13")(data)
+    if _from_version(data).startswith("0.13"):
+        data = create_updater_13_to_14()(data)
+    if _from_version(data).startswith("0.14"):
+        data = create_updater({}, "0.14", "0.15")(data)
+    if _from_version(data).startswith("0.15"):
+        data = create_updater_15_to_16()(data)
+    if _from_version(data).startswith("0.16"):
+        data = create_updater_16_to_17()(data)
+
     return json.dumps(data, indent=2)

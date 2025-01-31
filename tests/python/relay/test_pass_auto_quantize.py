@@ -25,11 +25,11 @@ from tvm.relay.expr import Call
 from tvm.topi.utils import get_const_tuple
 
 
-def quantize_and_build(out):
+def quantize_and_build(out, skip_conv_layers=[]):
     f = relay.Function(relay.analysis.free_vars(out), out)
     mod, params = testing.create_workload(f)
 
-    with relay.quantize.qconfig(skip_conv_layers=[]):
+    with relay.quantize.qconfig(skip_conv_layers=skip_conv_layers):
         qmod = relay.quantize.quantize(mod, params)
 
     relay.build(qmod, "llvm", params=params)
@@ -51,6 +51,43 @@ def test_mul_rewrite():
     pool = relay.nn.global_avg_pool2d(data=act)
 
     quantize_and_build(act * pool)
+
+
+def test_skip_conv():
+    data = relay.var("data", shape=(1, 16, 64, 64))
+    np_weight = np.random.rand(16, 16, 3, 3)
+    conv0_weight = relay.Constant(tvm.nd.array(np_weight)).astype("float32")
+    conv1_weight = relay.Constant(tvm.nd.array(np_weight)).astype("float32")
+    multiplier = relay.sigmoid(relay.var("data", shape=(1, 16, 1, 1)))
+
+    conv0 = relay.nn.conv2d(data, conv0_weight, kernel_size=(3, 3), padding=(1, 1), channels=16)
+    act0 = relay.nn.relu(data=conv0)
+    conv1 = relay.nn.conv2d(act0, conv1_weight, kernel_size=(3, 3), padding=(1, 1), channels=16)
+    act1 = relay.nn.relu(data=conv1)
+
+    quantize_and_build(act1 * multiplier)
+    quantize_and_build(act1 * multiplier, skip_conv_layers=[0])
+    quantize_and_build(act1 * multiplier, skip_conv_layers=[1])
+    quantize_and_build(act1 * multiplier, skip_conv_layers=[0, 1])
+
+
+def test_stop_quantize():
+    data = relay.var("data", shape=(1, 16, 64, 64))
+    np_weight0 = np.random.rand(16, 16, 3, 3)
+    conv0_weight = relay.Constant(tvm.nd.array(np_weight0)).astype("float32")
+    np_weight1 = np.random.rand(16, 16, 1, 1)
+    conv1_weight = relay.Constant(tvm.nd.array(np_weight1)).astype("float32")
+    multiplier = relay.sigmoid(relay.var("data", shape=(1, 16, 1, 1)))
+
+    conv0 = relay.nn.conv2d(data, conv0_weight, kernel_size=(3, 3), padding=(1, 1), channels=16)
+    act0 = relay.nn.relu(data=conv0)
+
+    pool = relay.nn.global_avg_pool2d(data=act0)
+
+    conv1 = relay.nn.conv2d(pool, conv1_weight, kernel_size=(1, 1), padding=(0, 0), channels=16)
+    act1 = relay.nn.relu(data=conv1)
+
+    quantize_and_build(act1 * multiplier)
 
 
 def test_batch_flatten_rewrite():
@@ -195,7 +232,7 @@ def verify_partition(mod, params):
 
 
 def test_add_partition():
-    mod = tvm.parser.parse(
+    mod = tvm.relay.parse(
         """
     #[version = "0.0.5"]
     def @main(
@@ -210,7 +247,7 @@ def test_add_partition():
 
 
 def test_conv2d_partition():
-    mod = tvm.parser.parse(
+    mod = tvm.relay.parse(
         """
     #[version = "0.0.5"]
     def @main(
@@ -229,7 +266,7 @@ def test_conv2d_partition():
 
 
 def test_multiple_arg_conversions_partition():
-    mod = tvm.parser.parse(
+    mod = tvm.relay.parse(
         """
     #[version = "0.0.5"]
     def @main(
@@ -258,7 +295,7 @@ def test_multiple_arg_conversions_partition():
 
 
 def test_unquantizable_prefix_partition():
-    mod = tvm.parser.parse(
+    mod = tvm.relay.parse(
         """
     #[version = "0.0.5"]
     def @main(
@@ -281,7 +318,7 @@ def test_unquantizable_prefix_partition():
 
 
 def test_unquantizable_core_partition():
-    mod = tvm.parser.parse(
+    mod = tvm.relay.parse(
         """
     #[version = "0.0.5"]
     def @main(
@@ -314,7 +351,7 @@ def test_unquantizable_core_partition():
 
 
 def test_unquantizable_suffix_partition():
-    mod = tvm.parser.parse(
+    mod = tvm.relay.parse(
         """
     #[version = "0.0.5"]
     def @main(
@@ -403,6 +440,78 @@ def test_dense_conv2d_rewrite():
     relay.analysis.post_order_visit(qnn_mod["main"], _check_dense)
 
 
+def test_add_lhs_is_none_annotate():
+    data_conv = relay.var("data_conv", shape=(1, 16, 64, 64))
+    conv2d_w = relay.const(np.random.random((16, 16, 3, 3)))
+    conv2d = relay.nn.conv2d(data_conv, conv2d_w, padding=(1, 1), kernel_size=(3, 3))
+    data_add = relay.var("data_add", shape=(16, 1, 1))
+    add = relay.add(data_add, conv2d)
+    global_avg_pool2d = relay.nn.global_avg_pool2d(add)
+    mod = tvm.IRModule.from_expr(global_avg_pool2d)
+
+    calibrate_data = [
+        {"data_conv": np.random.random((1, 16, 64, 64)), "data_add": np.random.random((16, 1, 1))}
+    ]
+
+    with tvm.transform.PassContext(opt_level=3):
+        with relay.quantize.qconfig(calibrate_mode="kl_divergence", skip_conv_layers=None):
+            qmod = relay.quantize.quantize(mod, dataset=calibrate_data)
+
+    params = [gen_rand_tvm(param.type_annotation, 0, 1) for param in mod["main"].params]
+
+    def _eval_mod(mod):
+        return relay.create_executor("vm", device=tvm.cpu(0), target="llvm", mod=mod).evaluate()(
+            *params
+        )
+
+    mod_result = _eval_mod(mod)
+    qmod_result = _eval_mod(qmod)
+    tvm.testing.assert_allclose(mod_result.numpy(), qmod_result.numpy(), rtol=1e-1, atol=1e-1)
+
+
+def test_add_lhs_rhs_is_input_annotate():
+    data_conv_r = relay.var("data_conv_r", shape=(1, 16, 64, 64))
+    conv2d_r = relay.nn.conv2d(
+        data_conv_r,
+        relay.const(np.random.random((16, 16, 3, 3))),
+        padding=(1, 1),
+        kernel_size=(3, 3),
+    )
+    data_conv_l = relay.var("data_conv_l", shape=(1, 16, 64, 64))
+    conv2d_l = relay.nn.conv2d(
+        data_conv_l,
+        relay.const(np.random.random((16, 16, 3, 3))),
+        padding=(1, 1),
+        kernel_size=(3, 3),
+    )
+    add = relay.add(conv2d_l, conv2d_r)
+    global_avg_pool2d = relay.nn.global_avg_pool2d(add)
+    mod = tvm.IRModule.from_expr(global_avg_pool2d)
+
+    calibrate_data = [
+        {
+            "data_conv_l": np.random.random((1, 16, 64, 64)),
+            "data_conv_r": np.random.random((1, 16, 64, 64)),
+            "data_add": np.random.random((16, 1, 1)),
+        }
+    ]
+
+    with tvm.transform.PassContext(opt_level=3):
+        with relay.quantize.qconfig(calibrate_mode="kl_divergence", skip_conv_layers=None):
+            qmod = relay.quantize.quantize(mod, dataset=calibrate_data)
+
+    params = [gen_rand_tvm(param.type_annotation, 0, 1) for param in mod["main"].params]
+
+    def _eval_mod(mod):
+        return relay.create_executor("vm", device=tvm.cpu(0), target="llvm", mod=mod).evaluate()(
+            *params
+        )
+
+    mod_result = _eval_mod(mod)
+    qmod_result = _eval_mod(qmod)
+    tvm.testing.assert_allclose(mod_result.numpy(), qmod_result.numpy(), rtol=1e-1, atol=1e-1)
+
+
 if __name__ == "__main__":
     test_mul_rewrite()
     test_batch_flatten_rewrite()
@@ -420,3 +529,9 @@ if __name__ == "__main__":
     test_unquantizable_suffix_partition()
     test_left_shift_negative()
     test_dense_conv2d_rewrite()
+
+    test_skip_conv()
+    test_stop_quantize()
+
+    test_add_lhs_is_none_annotate()
+    test_add_lhs_rhs_is_input_annotate()

@@ -17,9 +17,9 @@
 
 
 .PHONY: all \
-        runtime vta cpptest crttest \
-        lint pylint cpplint scalalint \
-	doc \
+        runtime cpptest crttest \
+        lint pylint cpplint \
+	cppdoc docs \
 	web webclean \
 	cython cython3 cyclean \
         clean
@@ -39,15 +39,10 @@ TVM_BUILD_PATH := $(abspath $(TVM_BUILD_PATH))
 # packaged version.
 DMLC_CORE_PATH ?= $(ROOTDIR)/3rdparty/dmlc-core
 DLPACK_PATH ?= $(ROOTDIR)/3rdparty/dlpack
-VTA_HW_PATH ?= $(ROOTDIR)/3rdparty/vta-hw
-
-
-
 
 all: $(addsuffix /all,$(TVM_BUILD_PATH))
 
 runtime: $(addsuffix /runtime,$(TVM_BUILD_PATH))
-vta: $(addsuffix /vta,$(TVM_BUILD_PATH))
 cpptest: $(addsuffix /cpptest,$(TVM_BUILD_PATH))
 crttest: $(addsuffix /crttest,$(TVM_BUILD_PATH))
 
@@ -78,7 +73,7 @@ FORCE:
 # Since the pattern stem is already being used for the directory name,
 # cannot also have it refer to the command passed to cmake.
 # Therefore, explicitly listing out the delegated.
-CMAKE_TARGETS = all runtime vta cpptest crttest
+CMAKE_TARGETS = all runtime cpptest crttest clean
 
 define GEN_CMAKE_RULE
 %/$(CMAKE_TARGET): %/CMakeCache.txt FORCE
@@ -92,7 +87,7 @@ $(foreach CMAKE_TARGET,$(CMAKE_TARGETS),$(eval $(GEN_CMAKE_RULE)))
 # scripts that are executed in the CI should be in tests/lint. This
 # allows docker/lint.sh to behave similarly to the CI.
 format:
-	./tests/lint/git-clang-format.sh -i origin/main
+	./tests/lint/git-clang-format.sh -i --rev origin/main
 	black .
 	cd rust && which cargo && cargo fmt --all
 
@@ -107,14 +102,10 @@ pylint:
 jnilint:
 	python3 3rdparty/dmlc-core/scripts/lint.py tvm4j-jni cpp jvm/native/src
 
-scalalint:
-	make -C $(VTA_HW_PATH)/hardware/chisel lint
-
-
 mypy:
 	tests/scripts/task_mypy.sh
 
-doc:
+cppdoc:
 	doxygen docs/Doxyfile
 
 
@@ -174,4 +165,7 @@ jvminstall:
 			-Dcurrent_libdir="$(TVM_BUILD_PATH)" $(JVM_TEST_ARGS))
 
 # Final cleanup rules, delegate to more specific rules.
-clean: cmake_clean cyclean webclean
+clean: $(addsuffix /clean,$(TVM_BUILD_PATH)) cyclean webclean
+
+docs:
+	python3 tests/scripts/ci.py docs

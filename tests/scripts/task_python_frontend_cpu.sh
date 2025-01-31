@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -17,8 +17,7 @@
 # under the License.
 
 # Test frontends that only need CPU resources
-set -e
-set -u
+set -euxo pipefail
 
 source tests/scripts/setup-pytest-env.sh
 # to avoid openblas threading error
@@ -37,6 +36,3 @@ run_pytest cython python-frontend-tflite tests/python/frontend/tflite
 
 echo "Running relay Keras frontend test..."
 run_pytest cython python-frontend-keras tests/python/frontend/keras
-
-echo "Running relay Caffe frontend test..."
-run_pytest cython python-frontend-caffe tests/python/frontend/caffe

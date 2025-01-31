@@ -14,10 +14,13 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# pylint: disable=global-variable-not-assigned
 """Global configuration/variable scope for autotvm"""
 
 
 class AutotvmGlobalScope(object):
+    """The global autotvm scope."""
+
     current = None
 
     def __init__(self):
@@ -27,6 +30,13 @@ class AutotvmGlobalScope(object):
         self.in_tuning = False
         self.silent = False
 
+    def deep_copy(self, global_scope):
+        """Deep copy from another instance of AutotvmGlobalScope."""
+        self._old = AutotvmGlobalScope.current
+
+        self.in_tuning = global_scope.in_tuning
+        self.silent = global_scope.silent
+
 
 GLOBAL_SCOPE = AutotvmGlobalScope()
 
@@ -34,5 +44,5 @@ GLOBAL_SCOPE = AutotvmGlobalScope()
 def reset_global_scope(global_scope):
     """Reset global autotvm state. This is needed to initialize PopenPool workers."""
     global GLOBAL_SCOPE
-    GLOBAL_SCOPE = global_scope
+    GLOBAL_SCOPE.deep_copy(global_scope)
     AutotvmGlobalScope.current = global_scope

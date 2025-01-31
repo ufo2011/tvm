@@ -15,15 +15,57 @@
 # specific language governing permissions and limitations
 # under the License.
 """Util to invoke C/C++ compilers in the system."""
-# pylint: disable=invalid-name
-import sys
 import os
+import shutil
 import subprocess
 
+# pylint: disable=invalid-name
+import sys
+from typing import Dict
+
 from .._ffi.base import py_str
+from . import tar as _tar
+from . import utils as _utils
 
 
-def create_shared(output, objects, options=None, cc="g++"):
+def _is_linux_like():
+    return (
+        sys.platform == "darwin"
+        or sys.platform.startswith("linux")
+        or sys.platform.startswith("freebsd")
+    )
+
+
+def _is_windows_like():
+    return sys.platform == "win32"
+
+
+def get_cc():
+    """Return the path to the default C/C++ compiler.
+
+    Returns
+    -------
+    out: Optional[str]
+        The path to the default C/C++ compiler, or None if none was found.
+    """
+
+    if not _is_linux_like():
+        return None
+
+    env_cxx = os.environ.get("CXX") or os.environ.get("CC")
+    if env_cxx:
+        return env_cxx
+    cc_names = ["g++", "gcc", "clang++", "clang", "c++", "cc"]
+    dirs_in_path = os.get_exec_path()
+    for cc in cc_names:
+        for d in dirs_in_path:
+            cc_path = os.path.join(d, cc)
+            if os.path.isfile(cc_path) and os.access(cc_path, os.X_OK):
+                return cc_path
+    return None
+
+
+def create_shared(output, objects, options=None, cc=None, cwd=None, ccache_env=None):
     """Create shared library.
 
     Parameters
@@ -39,20 +81,72 @@ def create_shared(output, objects, options=None, cc="g++"):
 
     cc : Optional[str]
         The compiler command.
+
+    cwd : Optional[str]
+        The current working directory.
+
+    ccache_env : Optional[Dict[str, str]]
+        The environment variable for ccache. Set `None` to disable ccache by default.
     """
-    if (
-        sys.platform == "darwin"
-        or sys.platform.startswith("linux")
-        or sys.platform.startswith("freebsd")
-    ):
-        _linux_compile(output, objects, options, cc, compile_shared=True)
-    elif sys.platform == "win32":
-        _windows_compile(output, objects, options)
+    cc = cc or get_cc()
+
+    if _is_linux_like():
+        _linux_compile(output, objects, options, cc, cwd, ccache_env, compile_shared=True)
+    elif _is_windows_like():
+        _windows_compile(output, objects, options, cwd, ccache_env)
     else:
         raise ValueError("Unsupported platform")
 
 
-def create_executable(output, objects, options=None, cc="g++"):
+def _linux_ar(output, inputs, ar):
+    ar = ar or "ar"
+
+    libname = os.path.basename(output)
+    if not libname.startswith("lib"):
+        libname = "lib" + libname
+    temp = _utils.tempdir()
+    temp_output = temp.relpath(libname)
+    cmd = [ar, "-crs", temp_output]
+
+    # handles the case where some input files are tar of objects
+    # unpack them and return the list of files inside
+    objects = _tar.normalize_file_list_by_unpacking_tars(temp, inputs)
+
+    cmd += objects
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    (out, _) = proc.communicate()
+    if proc.returncode != 0:
+        msg = "AR error:\n"
+        msg += py_str(out)
+        msg += "\nCommand line: " + " ".join(cmd)
+        raise RuntimeError(msg)
+
+    shutil.move(temp_output, output)
+
+
+def create_staticlib(output, inputs, ar=None):
+    """Create static library.
+
+    Parameters
+    ----------
+    output : str
+        The target shared library.
+
+    inputs : List[str]
+        List of inputs files. Each input file can be a tarball
+        of objects or an object file.
+
+    ar : Optional[str]
+        Path to the ar command to be used
+    """
+
+    if _is_linux_like():
+        return _linux_ar(output, inputs, ar)
+    else:
+        raise ValueError("Unsupported platform")
+
+
+def create_executable(output, objects, options=None, cc=None, cwd=None, ccache_env=None):
     """Create executable binary.
 
     Parameters
@@ -68,13 +162,66 @@ def create_executable(output, objects, options=None, cc="g++"):
 
     cc : Optional[str]
         The compiler command.
+
+    cwd : Optional[str]
+        The urrent working directory.
+
+    ccache_env : Optional[Dict[str, str]]
+        The environment variable for ccache. Set `None` to disable ccache by default.
     """
-    if sys.platform == "darwin" or sys.platform.startswith("linux"):
-        _linux_compile(output, objects, options, cc)
-    elif sys.platform == "win32":
-        _windows_compile(output, objects, options)
+    cc = cc or get_cc()
+
+    if _is_linux_like():
+        _linux_compile(output, objects, options, cc, cwd, ccache_env)
+    elif _is_windows_like():
+        _windows_compile(output, objects, options, cwd, ccache_env)
     else:
         raise ValueError("Unsupported platform")
+
+
+def get_global_symbol_section_map(path, *, nm=None) -> Dict[str, str]:
+    """Get global symbols from a library via nm -g
+
+    Parameters
+    ----------
+    path : str
+        The library path
+
+    nm: str
+        The path to nm command
+
+    Returns
+    -------
+    symbol_section_map: Dict[str, str]
+        A map from defined global symbol to their sections
+    """
+    if nm is None:
+        if not _is_linux_like():
+            raise ValueError("Unsupported platform")
+        nm = "nm"
+
+    symbol_section_map = {}
+
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"{path} does not exist")
+
+    cmd = [nm, "-gU", path]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    (out, _) = proc.communicate()
+
+    if proc.returncode != 0:
+        msg = "Runtime error:\n"
+        msg += py_str(out)
+        raise RuntimeError(msg)
+
+    for line in py_str(out).split("\n"):
+        data = line.strip().split()
+        if len(data) != 3:
+            continue
+        symbol = data[-1]
+        section = data[-2]
+        symbol_section_map[symbol] = section
+    return symbol_section_map
 
 
 def get_target_by_dump_machine(compiler):
@@ -109,11 +256,7 @@ def get_target_by_dump_machine(compiler):
 
 # assign so as default output format
 create_shared.output_format = "so" if sys.platform != "win32" else "dll"
-create_shared.get_target_triple = get_target_by_dump_machine(
-    os.environ.get(
-        "CXX", "g++" if sys.platform == "darwin" or sys.platform.startswith("linux") else None
-    )
-)
+create_shared.get_target_triple = get_target_by_dump_machine(os.environ.get("CXX", get_cc()))
 
 
 def cross_compiler(
@@ -156,12 +299,12 @@ def cross_compiler(
        # export using arm gcc
        mod = build_runtime_module()
        mod.export_library(path_dso,
-                          cc.cross_compiler("arm-linux-gnueabihf-gcc"))
+                          fcompile=cc.cross_compiler("arm-linux-gnueabihf-gcc"))
        # specialize ndk compilation options.
        specialized_ndk = cc.cross_compiler(
            ndk.create_shared,
            ["--sysroot=/path/to/sysroot", "-shared", "-fPIC", "-lm"])
-       mod.export_library(path_dso, specialized_ndk)
+       mod.export_library(path_dso, fcompile=specialized_ndk)
     """
     base_options = [] if options is None else options
     kwargs = {}
@@ -190,7 +333,9 @@ def cross_compiler(
     return _fcompile
 
 
-def _linux_compile(output, objects, options, compile_cmd="g++", compile_shared=False):
+def _linux_compile(
+    output, objects, options, compile_cmd, cwd=None, ccache_env=None, compile_shared=False
+):
     cmd = [compile_cmd]
     if compile_cmd != "nvcc":
         if compile_shared or output.endswith(".so") or output.endswith(".dylib"):
@@ -201,7 +346,7 @@ def _linux_compile(output, objects, options, compile_cmd="g++", compile_shared=F
             cmd += ["-c"]
     else:
         if compile_shared or output.endswith(".so") or output.endswith(".dylib"):
-            cmd += ["--shared"]
+            cmd += ["-shared"]
     cmd += ["-o", output]
     if isinstance(objects, str):
         cmd += [objects]
@@ -209,7 +354,15 @@ def _linux_compile(output, objects, options, compile_cmd="g++", compile_shared=F
         cmd += objects
     if options:
         cmd += options
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    env = None
+    if ccache_env is not None:
+        if shutil.which("ccache"):
+            cmd.insert(0, "ccache")
+            env = os.environ.copy()
+            env.update(ccache_env)
+        else:
+            raise ValueError("ccache not found")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd, env=env)
     (out, _) = proc.communicate()
     if proc.returncode != 0:
         msg = "Compilation error:\n"
@@ -218,9 +371,12 @@ def _linux_compile(output, objects, options, compile_cmd="g++", compile_shared=F
         raise RuntimeError(msg)
 
 
-def _windows_compile(output, objects, options):
-    cmd = ["clang"]
+def _windows_compile(output, objects, options, cwd=None, ccache_env=None):
+    compiler = os.getenv("TVM_WIN_CC", default="clang")
+    win_target = os.getenv("TVM_WIN_TARGET", default="x86_64")
+    cmd = [compiler]
     cmd += ["-O2"]
+    cmd += ["--target=" + win_target]
 
     if output.endswith(".so") or output.endswith(".dll"):
         cmd += ["-shared"]
@@ -233,9 +389,19 @@ def _windows_compile(output, objects, options):
     cmd += objects
     if options:
         cmd += options
+    env = None
+    if ccache_env is not None:
+        if shutil.which("ccache"):
+            cmd.insert(0, "ccache")
+            env = os.environ.copy()
+            env.update(ccache_env)
+        else:
+            raise ValueError("ccache not found")
 
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd, env=env
+        )
         (out, _) = proc.communicate()
     except FileNotFoundError:
         raise RuntimeError(

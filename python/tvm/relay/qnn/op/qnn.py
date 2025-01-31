@@ -14,19 +14,108 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-# pylint: disable=invalid-name
+# pylint: disable=invalid-name,unused-argument, not-context-manager
 """QNN dialect operators."""
 
 from __future__ import absolute_import as _abs
 
+import tvm
+import tvm.ir
 from tvm import relay
 from tvm.relay.expr import Tuple, TupleWrapper
 from tvm.relay.op.nn.utils import get_pad_tuple2d
+from tvm.runtime import Object
+from tvm.target import Target
 from tvm.topi.nn.qnn import SQNN_DTYPE_TO_CODE
+from tvm.target.x86 import target_has_features
 
-from ... import op as reg
-from ...op import OpPattern
-from . import _make
+from . import _make, _requantize
+
+
+@tvm._ffi.register_object("relay.qnn.op.RequantizeConfig")
+class RequantizeConfig(Object):
+    """Configure the requantization behavior by setting config variables.
+
+    Note
+    ----
+    This object is backed by node system in C++, with arguments that can be
+    exchanged between python and C++.
+
+    Do not construct directly, use requantize_config instead.
+
+    The fields that are backed by the C++ node are immutable once an instance
+    is constructed. Use _node_defaults getters to get results for the fields.
+    """
+
+    @staticmethod
+    def _get_node_default_rounding():
+        return "UPWARD"
+
+    @staticmethod
+    def _get_node_default_compute_dtype():
+        target = Target.current(True)
+        if target and str(target.kind) == "llvm":
+            if target_has_features("sse4.1", target):
+                return "float32"
+
+        return "int64"
+
+    _node_defaults = {
+        "rounding": _get_node_default_rounding.__func__,
+        "compute_dtype": _get_node_default_compute_dtype.__func__,
+    }
+
+    # pylint: disable=no-member
+    def __init__(self, handle):
+        """Initialize the function with handle
+
+        Parameters
+        ----------
+        handle : SymbolHandle
+            the handle to the underlying C++ Symbol
+        """
+        super(RequantizeConfig, self).__init__(handle)
+        self.handle = handle
+
+    def __enter__(self):
+        # pylint: disable=protected-access
+        _requantize._EnterRequantizeConfigScope(self)
+        return self
+
+    def __exit__(self, ptype, value, trace):
+        _requantize._ExitRequantizeConfigScope()
+
+    def __setattr__(self, name, value):
+        if name in RequantizeConfig._node_defaults:
+            raise AttributeError(f"'{type(self)}' object cannot set attribute '{name}'")
+        return super(RequantizeConfig, self).__setattr__(name, value)
+
+
+def current_requantize_config():
+    """Get the current requantization configuration."""
+    return _requantize._GetCurrentRequantizeConfig()
+
+
+def requantize_config(**kwargs):
+    """Configure the requantization behavior by setting config variables.
+
+    Parameters
+    ---------
+    rounding: "UPWARD" or "TONEAREST"
+        Rounding direction for fixed point multiplications.
+    compute_dtype:
+        Specifies the data type used during requantize.
+        Supported options: \"int64\", \"float32\", \"float64\"
+
+    Returns
+    -------
+    config: RequantizeConfig
+        The requantization configuration
+    """
+    node_args = {
+        k: v() if k not in kwargs else kwargs[k] for k, v in RequantizeConfig._node_defaults.items()
+    }
+    return tvm.ir.make_node("relay.qnn.op.RequantizeConfig", **node_args)
 
 
 def requantize(
@@ -36,7 +125,8 @@ def requantize(
     output_scale,
     output_zero_point,
     axis=-1,
-    rounding="UPWARD",
+    rounding="None",
+    compute_dtype="None",
     out_dtype="int8",
 ):
     r"""Requantized operator.
@@ -70,7 +160,9 @@ def requantize(
     rounding : string, optional
         Defines the rounding direction when the value is midway between two
         representable values.
-
+    compute_dtype:
+        Specifies the data type used during requantize.
+        Supported options: \"int64\", \"float32\", \"float64\"
     out_dtype : str, optional
         Specifies the output data type.
 
@@ -88,14 +180,15 @@ def requantize(
         output_zero_point,
         axis,
         rounding,
+        compute_dtype,
         out_dtype,
     )
 
 
 def quantize(data, output_scale, output_zero_point, axis=-1, out_dtype="int8"):
     r"""Quantize op
-    This operator takes float32 as input and produces quantized int8 or unit8 as output.
-    The input tensor can be of any shape. The output shape is the same as input shape.
+    This operator takes float32 input and produces quantized output. The input
+    tensor can be of any shape. The output shape is the same as input shape.
 
     Q_output = clamp((round(input_tensor/output_scale) + output_zero_point),
                      out_dtype::min,
@@ -105,14 +198,19 @@ def quantize(data, output_scale, output_zero_point, axis=-1, out_dtype="int8"):
     ----------
     data : tvm.relay.Expr
         The input tensor to be quantized. Can be of type float32.
-    output_zero_point : tvm.relay.Expr
-        The output zero_point.
+
     output_scale : tvm.relay.Expr
         The output scale.
+
+    output_zero_point : tvm.relay.Expr
+        The output zero_point.
+
     axis : int
         The channel axis for quantization. Default value is -1 which corresponds to the last axis.
+
     out_dtype : str, optional
-        The data type of the input tensor. Can be [int8, uint8, int32]
+        The data type of the output tensor. Can be [int8, unit8, int16, uint16, int32].
+
     Returns
     -------
     result : tvm.relay.Expr
@@ -132,14 +230,18 @@ def simulated_quantize(data, output_scale, output_zero_point, axis=-1, out_dtype
     ----------
     data : tvm.relay.Expr
         The input tensor to be quantized. Can be of type float32.
-    output_zero_point : tvm.relay.Expr
-        The output zero_point.
-    output_scale : tvm.relay.Expr
-        The output scale.
-    axis : int
-        The channel axis for quantization. Default value is -1 which corresponds to the last axis.
+
     out_dtype : string or tvm.relay.Expr
         A string or tensor indicating which datatype to quantize to.
+
+    output_scale : tvm.relay.Expr
+        The output scale.
+
+    output_zero_point : tvm.relay.Expr
+        The output zero_point.
+
+    axis : int
+        The channel axis for quantization. Default value is -1 which corresponds to the last axis.
 
     Returns
     -------
@@ -156,29 +258,35 @@ def simulated_quantize(data, output_scale, output_zero_point, axis=-1, out_dtype
     return _make.simulated_quantize(data, out_dtype, output_scale, output_zero_point, axis)
 
 
-def dequantize(data, input_scale, input_zero_point, axis=-1):
+def dequantize(data, input_scale, input_zero_point, axis=-1, out_dtype="float32"):
     r"""Dequantize op
-    This operator takes quantized int8 and unit8 as input and produces
-    dequantized float32 as output. The output shape is the same as input shape. The input
-    tensor can be of any shape.
+    This operator takes quantized input and produces dequantized float output.
+    The output shape is the same as input shape. The input tensor can be of any shape.
 
     Parameters
     ----------
     data : tvm.relay.Expr
-        The input tensor to be dequantized. Can be of type [int8, uint8, int32].
-    input_zero_point : tvm.relay.Expr
-        The input zero_point.
+        The input tensor to be dequantized. Can be of type [int8, unit8, int16, uint16, int32].
+
     input_scale : tvm.relay.Expr
         The input scale.
+
+    input_zero_point : tvm.relay.Expr
+        The input zero_point.
+
     axis : int
         The channel axis for quantization. Default value is -1 which corresponds to the last axis.
+
+    out_dtype : str, optional
+        The data type of the output tensor. Can be [float16, float32].
+
     Returns
     -------
     result : tvm.relay.Expr
         The computed result.
     """
 
-    return _make.dequantize(data, input_scale, input_zero_point, axis)
+    return _make.dequantize(data, input_scale, input_zero_point, axis, out_dtype)
 
 
 def simulated_dequantize(data, input_scale, input_zero_point, axis=-1, in_dtype="int8"):
@@ -191,14 +299,18 @@ def simulated_dequantize(data, input_scale, input_zero_point, axis=-1, in_dtype=
     ----------
     data : tvm.relay.Expr
         The input tensor to be dequantized.
-    input_zero_point : tvm.relay.Expr
-        The input zero_point.
-    input_scale : tvm.relay.Expr
-        The input scale.
-    axis : int
-        The channel axis for quantization. Default value is -1 which corresponds to the last axis.
+
     in_dtype : string or tvm.relay.Expr
         A string or tensor indicating which datatype to dequantize from.
+
+    input_scale : tvm.relay.Expr
+        The input scale.
+
+    input_zero_point : tvm.relay.Expr
+        The input zero_point.
+
+    axis : int
+        The channel axis for quantization. Default value is -1 which corresponds to the last axis.
 
     Returns
     -------
@@ -417,8 +529,8 @@ def conv2d_transpose(
     kernel_scale: tvm.relay.Expr
            The scale for the weight tensor. The scale for the weight tensor is
            stored for access to this during relay. This information is not
-           needed in the pass pipeline after qnn.transpose_conv2d is lowered to the
-           sequence of steps as in nn.transpose_conv2d. See also input_scale in Requantize.
+           needed in the pass pipeline after qnn.conv2d_transpose is lowered to the
+           sequence of steps as in nn.conv2d_transpose. See also input_scale in Requantize.
 
     strides : Tuple[int], optional
         The strides of convolution.
@@ -483,7 +595,16 @@ def conv2d_transpose(
 
 
 def add(
-    lhs, rhs, lhs_scale, lhs_zero_point, rhs_scale, rhs_zero_point, output_scale, output_zero_point
+    lhs,
+    rhs,
+    lhs_scale,
+    lhs_zero_point,
+    rhs_scale,
+    rhs_zero_point,
+    output_scale,
+    output_zero_point,
+    lhs_axis=-1,
+    rhs_axis=-1,
 ):
     """Quantized addition with numpy-style broadcasting.
 
@@ -513,6 +634,14 @@ def add(
     output_zero_point: relay.Expr
        The zero point of output quantized expr.
 
+    lhs_axis: int
+        The channel axis for lhs quantization. Default value is -1 which corresponds
+        to the last axis.
+
+    rhs_axis: int
+        The channel axis for rhs quantization. Default value is -1 which corresponds
+        to the last axis.
+
     Returns
     -------
     result : relay.Expr
@@ -528,6 +657,8 @@ def add(
         rhs_zero_point,
         output_scale,
         output_zero_point,
+        lhs_axis,
+        rhs_axis,
     )
 
 
@@ -591,8 +722,81 @@ def dense(
     )
 
 
+def contrib_dense_pack(
+    data,
+    weight,
+    input_zero_point,
+    kernel_zero_point,
+    input_scale,
+    kernel_scale,
+    kernel_layout="NC",
+    units=None,
+    out_dtype="int32",
+):
+    """Qnn contrib_dense_pack operator.
+    Applies a quantized linear transformation
+
+     .. math::
+
+     `Y = X * W`
+
+    If doing Per-channel quantization, qnn expects the kernel_zero_scale
+    and optionally the kernel_zero_point will be 1-D vectors instead of scalars.
+
+    Parameters
+    ----------
+    data : tvm.relay.Expr
+        The quantized input data to the operator.
+    weight : tvm.relay.Expr
+        The quantized weight expressions.
+    input_zero_point: tvm.relay.Expr
+        The input zero point.
+    kernel_zero_point: tvm.relay.Expr
+        The kernel zero point.
+    input_scale: tvm.relay.Expr
+        The scale for the input tensor.
+    kernel_scale: tvm.relay.Expr
+        The scale for the weight tensor. The scale for the weight tensor is
+        stored for access to this during relay. This information is not
+        needed in the pass pipeline after qnn.conv2d is lowered to the
+        sequence of steps as in nn.conv2d. See also input_scale in Requantize.
+    kernel_layout: str
+        The layout of weight, such as "NC" or "NC32n4c".
+    units : int, optional
+        Number of hidden units of the dense transformation.
+    out_dtype : str, optional
+        Specifies the output data type for mixed precision dense can be int32 or int16.
+
+    Returns
+    -------
+    result : tvm.relay.Expr
+        The computed result.
+    """
+
+    return _make.contrib_dense_pack(
+        data,
+        weight,
+        input_zero_point,
+        kernel_zero_point,
+        input_scale,
+        kernel_scale,
+        kernel_layout,
+        units,
+        out_dtype,
+    )
+
+
 def mul(
-    lhs, rhs, lhs_scale, lhs_zero_point, rhs_scale, rhs_zero_point, output_scale, output_zero_point
+    lhs,
+    rhs,
+    lhs_scale,
+    lhs_zero_point,
+    rhs_scale,
+    rhs_zero_point,
+    output_scale,
+    output_zero_point,
+    lhs_axis=-1,
+    rhs_axis=-1,
 ):
     """Quantized multiplication with numpy-style broadcasting.
 
@@ -622,6 +826,14 @@ def mul(
     output_zero_point: relay.Expr
        The zero point of output quantized expr.
 
+    lhs_axis: int
+        The channel axis for lhs quantization. Default value is -1 which corresponds
+        to the last axis.
+
+    rhs_axis: int
+        The channel axis for rhs quantization. Default value is -1 which corresponds
+        to the last axis.
+
     Returns
     -------
     result : relay.Expr
@@ -637,11 +849,286 @@ def mul(
         rhs_zero_point,
         output_scale,
         output_zero_point,
+        lhs_axis,
+        rhs_axis,
     )
 
 
+def tanh(x, scale, zero_point, output_scale, output_zero_point):
+    """Quantized tanh.
+
+    Parameters
+    ----------
+    x : relay.Expr
+        The quantized input tensor.
+
+    scale: relay.Expr
+        The scale of the quantized expr.
+
+    zero_point: relay.Expr
+       The zero point of quantized expr.
+
+    output_scale: relay.Expr
+        The scale of the output quantized expr.
+
+    output_zero_point: relay.Expr
+       The zero point of output quantized expr.
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+
+    """
+    return _make.tanh(x, scale, zero_point, output_scale, output_zero_point)
+
+
+def exp(x, scale, zero_point, output_scale, output_zero_point):
+    """Quantized exponential function.
+
+    Parameters
+    ----------
+    x : relay.Expr
+        The quantized input tensor.
+
+    scale: relay.Expr
+        The scale of the quantized expr.
+
+    zero_point: relay.Expr
+       The zero point of quantized expr.
+
+    output_scale: relay.Expr
+        The scale of the output quantized expr.
+
+    output_zero_point: relay.Expr
+       The zero point of output quantized expr.
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+
+    """
+    return _make.exp(x, scale, zero_point, output_scale, output_zero_point)
+
+
+def sqrt(x, scale, zero_point, output_scale, output_zero_point):
+    """Quantized square root.
+
+    Parameters
+    ----------
+    x : relay.Expr
+        The quantized input tensor.
+
+    scale: relay.Expr
+        The scale of the quantized expr.
+
+    zero_point: relay.Expr
+       The zero point of quantized expr.
+
+    output_scale: relay.Expr
+        The scale of the output quantized expr.
+
+    output_zero_point: relay.Expr
+       The zero point of output quantized expr.
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+
+    """
+    return _make.sqrt(x, scale, zero_point, output_scale, output_zero_point)
+
+
+def rsqrt(x, scale, zero_point, output_scale, output_zero_point):
+    """Quantized reciprocal square root.
+
+    Parameters
+    ----------
+    x : relay.Expr
+        The quantized input tensor.
+
+    scale: relay.Expr
+        The scale of the quantized expr.
+
+    zero_point: relay.Expr
+       The zero point of quantized expr.
+
+    output_scale: relay.Expr
+        The scale of the output quantized expr.
+
+    output_zero_point: relay.Expr
+       The zero point of output quantized expr.
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+
+    """
+    return _make.rsqrt(x, scale, zero_point, output_scale, output_zero_point)
+
+
+def erf(x, scale, zero_point, output_scale, output_zero_point):
+    """Quantized error function.
+
+    Parameters
+    ----------
+    x : relay.Expr
+        The quantized input tensor.
+
+    scale: relay.Expr
+        The scale of the quantized expr.
+
+    zero_point: relay.Expr
+       The zero point of quantized expr.
+
+    output_scale: relay.Expr
+        The scale of the output quantized expr.
+
+    output_zero_point: relay.Expr
+       The zero point of output quantized expr.
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+
+    """
+    return _make.erf(x, scale, zero_point, output_scale, output_zero_point)
+
+
+# pylint: disable=redefined-builtin
+
+
+def abs(x, scale, zero_point, output_scale, output_zero_point):
+    """Quantized abs function.
+
+    Parameters
+    ----------
+    x : relay.Expr
+        The quantized input tensor.
+
+    scale: relay.Expr
+        The scale of the quantized expr.
+
+    zero_point: relay.Expr
+       The zero point of quantized expr.
+
+    output_scale: relay.Expr
+        The scale of the output quantized expr.
+
+    output_zero_point: relay.Expr
+       The zero point of output quantized expr.
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+
+    """
+    return _make.abs(x, scale, zero_point, output_scale, output_zero_point)
+
+
+def sigmoid(x, scale, zero_point, output_scale, output_zero_point):
+    """Quantized sigmoid.
+
+    Parameters
+    ----------
+    x : relay.Expr
+        The quantized input tensor.
+
+    scale: relay.Expr
+        The scale of the quantized expr.
+
+    zero_point: relay.Expr
+       The zero point of quantized expr.
+
+    output_scale: relay.Expr
+        The scale of the output quantized expr.
+
+    output_zero_point: relay.Expr
+       The zero point of output quantized expr.
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+
+    """
+    return _make.sigmoid(x, scale, zero_point, output_scale, output_zero_point)
+
+
+def hardswish(x, scale, zero_point, output_scale, output_zero_point):
+    """Quantized hardswish.
+
+    Parameters
+    ----------
+    x : relay.Expr
+        The quantized input tensor.
+
+    scale: relay.Expr
+        The scale of the quantized expr.
+
+    zero_point: relay.Expr
+       The zero point of quantized expr.
+
+    output_scale: relay.Expr
+        The scale of the output quantized expr.
+
+    output_zero_point: relay.Expr
+       The zero point of output quantized expr.
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+
+    """
+    return _make.hardswish(x, scale, zero_point, output_scale, output_zero_point)
+
+
+def log(x, scale, zero_point, output_scale, output_zero_point):
+    """Quantized log.
+
+    Parameters
+    ----------
+    x : relay.Expr
+        The quantized input tensor.
+
+    scale: relay.Expr
+        The scale of the quantized expr.
+
+    zero_point: relay.Expr
+       The zero point of quantized expr.
+
+    output_scale: relay.Expr
+        The scale of the output quantized expr.
+
+    output_zero_point: relay.Expr
+       The zero point of output quantized expr.
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+
+    """
+    return _make.log(x, scale, zero_point, output_scale, output_zero_point)
+
+
 def subtract(
-    lhs, rhs, lhs_scale, lhs_zero_point, rhs_scale, rhs_zero_point, output_scale, output_zero_point
+    lhs,
+    rhs,
+    lhs_scale,
+    lhs_zero_point,
+    rhs_scale,
+    rhs_zero_point,
+    output_scale,
+    output_zero_point,
+    lhs_axis=-1,
+    rhs_axis=-1,
 ):
     """Quantized subtraction with numpy-style broadcasting.
 
@@ -671,6 +1158,14 @@ def subtract(
     output_zero_point: relay.Expr
        The zero point of output quantized expr.
 
+    lhs_axis: int
+        The channel axis for lhs quantization. Default value is -1 which corresponds
+        to the last axis.
+
+    rhs_axis: int
+        The channel axis for rhs quantization. Default value is -1 which corresponds
+        to the last axis.
+
     Returns
     -------
     result : relay.Expr
@@ -686,6 +1181,8 @@ def subtract(
         rhs_zero_point,
         output_scale,
         output_zero_point,
+        lhs_axis,
+        rhs_axis,
     )
 
 
@@ -727,6 +1224,98 @@ def batch_matmul(x, y, x_zero_point, y_zero_point, x_scale, y_scale, out_dtype="
     return _make.batch_matmul(x, y, x_zero_point, y_zero_point, x_scale, y_scale, out_dtype)
 
 
-# register fuse pattern for qnn ops
-reg.register_pattern("qnn.quantize", OpPattern.OPAQUE)
-reg.register_pattern("qnn.dequantize", OpPattern.OPAQUE)
+def leaky_relu(x, alpha, input_scale, input_zero_point, output_scale, output_zero_point):
+    """Quantized leaky relu.
+
+    Parameters
+    ----------
+    x : relay.Expr
+        The quantized input tensor.
+    alpha: double
+        The alpha value.
+    input_scale: relay.Expr
+        The scale of the input quantized expr.
+    input_zero_point: relay.Expr
+       The zero point of input quantized expr.
+    output_scale: relay.Expr
+        The scale of the output quantized expr.
+    output_zero_point: relay.Expr
+       The zero point of output quantized expr.
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+    """
+    return _make.leaky_relu(
+        x, alpha, input_scale, input_zero_point, output_scale, output_zero_point
+    )
+
+
+def softmax(x, scale, zero_point, output_scale, output_zero_point, axis=-1):
+    return _make.softmax(x, axis, scale, zero_point, output_scale, output_zero_point)
+
+
+def avg_pool2d(
+    data,
+    input_scale,
+    input_zero_point,
+    output_scale,
+    output_zero_point,
+    pool_size,
+    strides,
+    padding,
+    dilation,
+    ceil_mode=False,
+    count_include_pad=True,
+    layout="NHWC",
+    out_layout="",
+):
+
+    """Quantized avg_pool2d
+
+    Parameters
+    ----------
+    data : relay.Expr
+        The quantized input tensor.
+    input_scale: float
+        The scale of the input quantized expr.
+    input_zero_point: int
+        The zero point of input quantized expr.
+    output_scale: flaot
+        The scale of the output quantized expr.
+    output_zero_point: int
+       The zero point of output quantized expr.
+    pool_size : relay.Expr
+        The pool_size
+    strides : relay.Expr
+        The strides
+    padding : relay.Expr
+        The padding size
+    dilation : relay.Expr
+        The dilation size
+    ceil_mode : bool, optional
+        Whether to use ceil or floor for calculating the output shape
+    count_include_pad : bool, optional
+        Determines if padding should be taken into account in the computation
+    layout: string, optinal
+    out_layout: string, optional
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+    """
+    return _make.avg_pool2d(
+        data,
+        input_scale,
+        input_zero_point,
+        output_scale,
+        output_zero_point,
+        pool_size,
+        strides,
+        padding,
+        dilation,
+        ceil_mode,
+        count_include_pad,
+        layout,
+        out_layout,
+    )

@@ -51,14 +51,14 @@ The list of options include:
 
    Build TVM system library module. System lib is a global module that contains
    self registered functions in program startup. User can get the module using
-   :any:`tvm.runtime.system_lib`.
+   `tvm.runtime.system_lib`.
    It is useful in environments where dynamic loading api like dlopen is banned.
    The system lib will be available as long as the result code is linked by the program.
 
 We can use :py:func:`tvm.target.Target` to create a tvm.target.Target from the target string.
 We can also use other specific function in this module to create specific targets.
 """
-from .target import Target, create
+from .target import Target, create, TargetKind
 from .target import (
     cuda,
     rocm,
@@ -66,12 +66,12 @@ from .target import (
     intel_graphics,
     arm_cpu,
     rasp,
-    vta,
     bifrost,
     riscv_cpu,
     hexagon,
+    stm32,
 )
-from .se_scope import make_se_scope
+from .virtual_device import VirtualDevice
 from .compilation_config import make_compilation_config
 from .tag import list_tags
 from .generic_func import GenericFunc

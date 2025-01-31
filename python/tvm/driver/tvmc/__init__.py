@@ -14,12 +14,20 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-# pylint: disable=redefined-builtin
+# pylint: disable=redefined-builtin,wrong-import-position
 """
 TVMC - TVM driver command-line interface
 """
 
-from . import micro
+
+class TVMCException(Exception):
+    """TVMC Exception"""
+
+
+class TVMCImportError(TVMCException):
+    """TVMC TVMCImportError"""
+
+
 from . import runner
 from . import autotuner
 from . import compiler
