@@ -1,4 +1,4 @@
-#!/bin/bash -e
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,15 +16,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
+set -euxo pipefail
 
 function cleanup() {
     rm -f /tmp/$$.log.txt /tmp/$$.logclean.txt
 }
 trap cleanup EXIT
 
-make doc 2>/tmp/$$.log.txt
+make cppdoc 2>/tmp/$$.log.txt
 
-grep -v -E "ENABLE_PREPROCESSING|unsupported tag" < /tmp/$$.log.txt > /tmp/$$.logclean.txt || true
+grep -v -E "ENABLE_PREPROCESSING|unsupported tag|Inheritance graph" < /tmp/$$.log.txt > /tmp/$$.logclean.txt || true
 echo "---------Error Log----------"
 cat /tmp/$$.logclean.txt
 echo "----------------------------"

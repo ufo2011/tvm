@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,9 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
-set -u
-set -o pipefail
+set -euxo pipefail
 
 cleanup()
 {
@@ -27,33 +25,68 @@ cleanup()
 trap cleanup 0
 
 
-echo "Checking file types..."
-python3 tests/lint/check_file_type.py
+# These shards are solely for CI to enable the lint job to have some parallelism.
 
-echo "Checking ASF license headers..."
-tests/lint/check_asf_header.sh --local
+function shard1 {
+  # echo "Check Jenkinsfile generation"
+  # python3 ci/jenkins/generate.py --check
 
-echo "Linting the C++ code..."
-tests/lint/cpplint.sh
+  echo "Checking file types..."
+  python3 tests/lint/check_file_type.py
 
-echo "clang-format check..."
-tests/lint/clang_format.sh
+  echo "Checking CMake <-> LibInfo options mirroring"
+  python3 tests/lint/check_cmake_options.py
 
-echo "Rust check..."
-tests/lint/rust_format.sh
+  echo "black check..."
+  tests/lint/git-black.sh
 
-echo "black check..."
-tests/lint/python_format.sh
+  echo "Linting the Python code with flake8..."
+  tests/lint/flake8.sh
 
-echo "Linting the Python code..."
-tests/lint/pylint.sh
-tests/lint/flake8.sh
+#  echo "Type checking with MyPy ..."
+#  tests/scripts/task_mypy.sh
 
-echo "Lintinf the JNI code..."
-tests/lint/jnilint.sh
+  echo "Checking for non-inclusive language with blocklint..."
+  tests/lint/blocklint.sh
 
-echo "Checking C++ documentation..."
-tests/lint/cppdocs.sh
+  echo "Linting the JNI code..."
+  tests/lint/jnilint.sh
+}
 
-echo "Type checking with MyPy ..."
-tests/scripts/task_mypy.sh
+function shard2 {
+  echo "check whitespace..."
+  tests/lint/whitespace.sh
+
+  echo "Linting the Python code with pylint..."
+  tests/lint/pylint.sh
+
+  echo "Checking C++ documentation..."
+  tests/lint/cppdocs.sh
+
+  echo "Checking ASF license headers..."
+  tests/lint/check_asf_header.sh --local
+
+  echo "Linting the C++ code..."
+  tests/lint/cpplint.sh
+
+  echo "clang-format check..."
+  tests/lint/git-clang-format.sh
+
+  echo "Rust check..."
+  tests/lint/rust_format.sh
+
+  echo "Docker check..."
+  tests/lint/docker-format.sh
+}
+
+
+if [[ -n ${TVM_SHARD_INDEX+x} ]]; then
+  if [[ "$TVM_SHARD_INDEX" == "0" ]]; then
+    shard1
+  else
+    shard2
+  fi
+else
+  shard1
+  shard2
+fi

@@ -163,19 +163,18 @@ std::vector<int32_t> SampleWithoutReplacement(
 }
 
 int64_t SampleCategorical(support::LinearCongruentialEngine::TRandState* rand_state,
-                          const Array<Integer>& candidates, const Array<FloatImm>& probs,
-                          Optional<Integer>* decision) {
+                          const Array<runtime::Int>& candidates, const Array<runtime::Float>& probs,
+                          Optional<runtime::Int>* decision) {
   CHECK(candidates.size() == probs.size())
       << "ValueError: number of candidates does not match number of probabilities.";
   int32_t i = -1;
   int32_t n = candidates.size();
   if (decision->defined()) {
-    const auto* int_imm = decision->as<IntImmNode>();
-    i = int_imm->value;
+    i = decision->value()->value;
     CHECK(0 <= i && i < n) << "ValueError: Wrong decision value, where n = " << n
                            << ", but decision is: " << i;
   } else {
-    std::vector<double> weights = support::AsVector<FloatImm, double>(probs);
+    std::vector<double> weights = support::AsVector<runtime::Float, double>(probs);
     std::discrete_distribution<int32_t> dist(weights.begin(), weights.end());
     support::LinearCongruentialEngine rand_(rand_state);
     i = dist(rand_);
@@ -183,8 +182,30 @@ int64_t SampleCategorical(support::LinearCongruentialEngine::TRandState* rand_st
                             << ", but decision is: " << i;
   }
 
-  *decision = Integer(i);  // decision is guaranteed not to be nullptr.
-  return candidates[i];
+  *decision = runtime::Int(i);  // decision is guaranteed not to be nullptr.
+  return candidates[i]->value;
+}
+
+std::function<int32_t()> MakeMultinomialSampler(
+    support::LinearCongruentialEngine::TRandState* rand_state, const std::vector<double>& weights) {
+  ICHECK(!weights.empty());
+  std::vector<double> sums;
+  sums.reserve(weights.size());
+  double sum = 0.0;
+  for (double w : weights) {
+    sums.push_back(sum += w);
+  }
+  return [rng = support::LinearCongruentialEngine(rand_state).ForkSeed(),
+          dist = std::uniform_real_distribution<double>(0.0, sum),
+          sums = std::move(sums)]() mutable -> int32_t {
+    support::LinearCongruentialEngine rand_(&rng);
+    double p = dist(rand_);
+    int32_t idx = std::lower_bound(sums.begin(), sums.end(), p) - sums.begin();
+    int32_t n = sums.size();
+    CHECK_LE(0, idx);
+    CHECK_LE(idx, n);
+    return (idx == n) ? (n - 1) : idx;
+  };
 }
 
 std::vector<int64_t> SamplePerfectTile(support::LinearCongruentialEngine::TRandState* rand_state,
@@ -277,32 +298,22 @@ std::vector<int64_t> SamplePerfectTile(support::LinearCongruentialEngine::TRandS
     return SamplePerfectTile(rand_state, extent, n_splits);
   }
   CHECK_GE(n_splits, 2) << "ValueError: Cannot tile a loop into " << n_splits << " splits";
-  std::vector<int32_t> innermost_candidates;
-  innermost_candidates.reserve(max_innermost_factor);
-  for (int32_t i = 1; i <= max_innermost_factor; ++i) {
-    if (extent % i == 0) {
-      innermost_candidates.push_back(i);
+  while (true) {
+    std::vector<int64_t> result = SamplePerfectTile(rand_state, extent, n_splits);
+    if (result.back() <= max_innermost_factor) {
+      return result;
     }
   }
-  // N.B. Theoretically sampling evenly breaks the uniform sampling of the global sampling space.
-  // We should do multiple factorization to weight the choices. However, it would lead to slower
-  // sampling speed. On the other hand, considering potential tricks we might do on the innermost
-  // loop, in which sampling uniformly does not help, let's leave it as it is for now, and maybe add
-  // more heuristics in the future
-  int32_t innermost = innermost_candidates[SampleInt(rand_state, 0, innermost_candidates.size())];
-  std::vector<int64_t> result = SamplePerfectTile(rand_state, extent / innermost, n_splits - 1);
-  result.push_back(innermost);
-  return result;
 }
 
 std::vector<int64_t> SamplePerfectTile(
     support::LinearCongruentialEngine::TRandState* rand_state,  //
     const tir::StmtSRef& loop_sref, int32_t n_splits, int32_t max_innermost_factor,
     Optional<Array<Integer>>* decision) {
-  const ForNode* loop = TVM_SREF_TO_FOR(loop, loop_sref);
-  int64_t extent = GetLoopIntExtent(loop);
+  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+  const int64_t* extent = GetLoopIntExtent(loop);
   std::vector<int64_t> result;
-  if (extent == -1) {
+  if (extent == nullptr) {
     // Case 1. Handle loops with non-constant length
     result = std::vector<int64_t>(n_splits, 1);
     result[0] = -1;
@@ -311,7 +322,7 @@ std::vector<int64_t> SamplePerfectTile(
     result = support::AsVector<Integer, int64_t>(decision->value());
     int n = result.size();
     ICHECK_GE(n, 2);
-    int64_t len = extent;
+    int64_t len = *extent;
     for (int i = n - 1; i > 0; --i) {
       int64_t& l = result[i];
       // A previous decision could become invalid because of the change of outer tiles
@@ -325,11 +336,117 @@ std::vector<int64_t> SamplePerfectTile(
     result[0] = len;
   } else {
     // Case 3. Use fresh new sampling result
-    result = SamplePerfectTile(rand_state, extent, n_splits, max_innermost_factor);
-    ICHECK_LE(result.back(), max_innermost_factor);
+    result = SamplePerfectTile(rand_state, *extent, n_splits, max_innermost_factor);
+    if (max_innermost_factor != -1) {
+      ICHECK_LE(result.back(), max_innermost_factor);
+    }
   }
   *decision = support::AsArray<int64_t, Integer>(result);
   return result;
+}
+
+TVM_DLL std::vector<int64_t> SamplePartitionedTile(
+    support::LinearCongruentialEngine::TRandState* rand_state,  //
+    int32_t extent, int32_t n_splits, int32_t partition_pos, int32_t innerpart_factor) {
+  if (partition_pos == 0 && innerpart_factor == 1) {
+    return SamplePerfectTile(rand_state, extent, n_splits);
+  }
+  CHECK_GE(n_splits, 2) << "ValueError: Cannot tile a loop into " << n_splits << " splits";
+  auto judge = [&](const std::vector<int64_t>& tile) {
+    int64_t prod = 1;
+    for (int i = partition_pos; i < n_splits; ++i) {
+      prod *= tile[i];
+    }
+    return prod % innerpart_factor == 0;
+  };
+  while (true) {
+    std::vector<int64_t> result = SamplePerfectTile(rand_state, extent, n_splits);
+    if (judge(result)) {
+      return result;
+    }
+  }
+}
+
+std::vector<int64_t> SamplePartitionedTile(
+    support::LinearCongruentialEngine::TRandState* rand_state,  //
+    const tir::StmtSRef& loop_sref, int32_t n_splits, int32_t partition_pos,
+    int32_t innerpart_factor, Optional<Array<Integer>>* decision) {
+  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+  const int64_t* extent = GetLoopIntExtent(loop);
+  std::vector<int64_t> result;
+  if (extent == nullptr || *extent % innerpart_factor != 0) {
+    // Case 1. Handle loops with non-constant length or non-divisible innerpart_factor
+    result = std::vector<int64_t>(n_splits, 1);
+    result[0] = -1;
+  } else if (decision->defined()) {
+    // Case 2. Use previous decision
+    result = support::AsVector<Integer, int64_t>(decision->value());
+    int n = result.size();
+    ICHECK_GE(n, 2);
+    int innerpart_prod = 1;
+    for (int i = partition_pos; i < n; ++i) {
+      innerpart_prod *= result[i];
+    }
+    if (innerpart_prod % innerpart_factor != 0) {
+      // Case 2.1. Handle loops with non-divisible innerpart_factor
+      // we use a trivial default solution:
+      // (extent // innerpart_factor, 1, ..., 1, innerpart_factor, 1, ..., 1)
+      result = std::vector<int64_t>(n_splits, 1);
+      result[0] = *extent / innerpart_factor;
+      result[partition_pos] = innerpart_factor;
+    } else {
+      // Case 2.2. Use previous decision but fix it to perfect
+      int64_t len = *extent;
+      for (int i = n - 1; i > 0; --i) {
+        int64_t& l = result[i];
+        // A previous decision could become invalid because of the change of outer tiles
+        // To handle this case properly, we check if the tiling strategy is still perfect.
+        // If not, we use a trivial default solution (1, 1, ..., 1, L) for rest of the tiles
+        if (len % l != 0) {
+          l = len;
+        }
+        len /= l;
+      }
+      result[0] = len;
+    }
+  } else {
+    // Case 3. Use fresh new sampling result
+    result = SamplePartitionedTile(rand_state, *extent, n_splits, partition_pos, innerpart_factor);
+  }
+  *decision = support::AsArray<int64_t, Integer>(result);
+  return result;
+}
+
+tir::StmtSRef SampleComputeLocation(tir::ScheduleState self,
+                                    support::LinearCongruentialEngine::TRandState* rand_state,
+                                    const StmtSRef& block_sref, Optional<Integer>* decision) {
+  // Step 1. Collect all possible compute-at locations.
+  auto [location_srefs, location_indices] = CollectComputeLocation(self, block_sref);
+  ICHECK_EQ(location_srefs.size(), location_indices.size());
+
+  // Step 2. If there was a previous decision, keep the decision unchanged if it exists in the
+  // location candidates. Otherwise, pick the location before the previous decision.
+  // Step 3. If there was not a previous decision, sample a decision from the collected locations.
+  if (decision->defined()) {
+    int64_t old_decision = Downcast<Integer>(*decision)->value;
+    auto it = std::lower_bound(location_indices.begin(), location_indices.end(), old_decision);
+    int idx = it - location_indices.begin();
+
+    if (it != location_indices.end() && *it == old_decision) {
+      *decision = Integer(old_decision);
+      return location_srefs[idx];
+    } else if (it != location_indices.begin()) {
+      *decision = Integer(location_indices[idx - 1]);
+      return location_srefs[idx - 1];
+    } else {
+      *decision = Integer(-1);
+      return StmtSRef::RootMark();
+    }
+  } else {
+    int sampled_idx = SampleInt(rand_state, 0, location_indices.size());
+    *decision = Integer(location_indices[sampled_idx]);
+    return location_srefs[sampled_idx];
+  }
 }
 
 /******** InstructionKind Registration ********/
@@ -343,10 +460,10 @@ struct SampleCategoricalTraits : public UnpackedInstTraits<SampleCategoricalTrai
   static constexpr size_t kNumAttrs = 2;
   static constexpr size_t kNumDecisions = 1;
 
-  static ExprRV UnpackedApplyToSchedule(Schedule sch,               //
-                                        Array<Integer> candidates,  //
-                                        Array<FloatImm> probs,      //
-                                        Optional<Integer> decision) {
+  static ExprRV UnpackedApplyToSchedule(Schedule sch,                    //
+                                        Array<runtime::Int> candidates,  //
+                                        Array<runtime::Float> probs,     //
+                                        Optional<runtime::Int> decision) {
     return sch->SampleCategorical(candidates, probs, decision);
   }
 
@@ -396,8 +513,72 @@ struct SamplePerfectTileTraits : public UnpackedInstTraits<SamplePerfectTileTrai
   friend struct ::tvm::tir::UnpackedInstTraits;
 };
 
+struct SamplePartitionedTileTraits : public UnpackedInstTraits<SamplePartitionedTileTraits> {
+  static constexpr const char* kName = "SamplePartitionedTile";
+  static constexpr bool kIsPure = true;
+
+ private:
+  static constexpr size_t kNumInputs = 1;
+  static constexpr size_t kNumAttrs = 3;
+  static constexpr size_t kNumDecisions = 1;
+
+  static Array<ExprRV> UnpackedApplyToSchedule(Schedule sch, LoopRV loop_rv, Integer n,
+                                               Integer partition_pos, Integer innerpart_factor,
+                                               Optional<Array<Integer>> decision) {
+    return sch->SamplePartitionedTile(loop_rv, n->value, partition_pos->value,
+                                      innerpart_factor->value, decision);
+  }
+
+  static String UnpackedAsPython(Array<String> outputs, String loop_rv, Integer n,
+                                 Integer partition_pos, Integer innerpart_factor,
+                                 Optional<Array<Integer>> decision) {
+    PythonAPICall py("sample_partitioned_tile");
+    py.Input("loop", loop_rv);
+    py.Input("n", n->value);
+    py.Input("partition_pos", partition_pos->value);
+    py.Input("innerpart_factor", innerpart_factor->value);
+    py.Decision(decision);
+    py.OutputList(outputs);
+    return py.Str();
+  }
+
+  template <typename>
+  friend struct ::tvm::tir::UnpackedInstTraits;
+};
+
+struct SampleComputeLocationTraits : public UnpackedInstTraits<SampleComputeLocationTraits> {
+  static constexpr const char* kName = "SampleComputeLocation";
+  static constexpr bool kIsPure = true;
+
+ private:
+  static constexpr size_t kNumInputs = 1;
+  static constexpr size_t kNumAttrs = 0;
+  static constexpr size_t kNumDecisions = 1;
+
+  static LoopRV UnpackedApplyToSchedule(Schedule sch,      //
+                                        BlockRV block_rv,  //
+                                        Optional<Integer> decision) {
+    return sch->SampleComputeLocation(block_rv, decision);
+  }
+
+  static String UnpackedAsPython(Array<String> outputs,  //
+                                 String block_rv,        //
+                                 Optional<Integer> decision) {
+    PythonAPICall py("sample_compute_location");
+    py.Input("block", block_rv);
+    py.Decision(decision);
+    py.SingleOutput(outputs);
+    return py.Str();
+  }
+
+  template <typename>
+  friend struct ::tvm::tir::UnpackedInstTraits;
+};
+
 TVM_REGISTER_INST_KIND_TRAITS(SampleCategoricalTraits);
 TVM_REGISTER_INST_KIND_TRAITS(SamplePerfectTileTraits);
+TVM_REGISTER_INST_KIND_TRAITS(SamplePartitionedTileTraits);
+TVM_REGISTER_INST_KIND_TRAITS(SampleComputeLocationTraits);
 
 }  // namespace tir
 }  // namespace tvm

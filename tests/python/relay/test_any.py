@@ -15,10 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 import os
+import platform
 
 import numpy as np
 import pytest
+
 import tvm
+import tvm.testing
 import tvm.topi.testing
 from tvm import relay, te
 from tvm.relay.loops import while_loop
@@ -234,6 +237,7 @@ def verify_any_reshape(x_shape, newshape, x_np_shape, out_shape, variable_newsha
     x = relay.var("x", shape=x_shape, dtype="float32")
     relu_x = relay.nn.relu(x)
     data = np.random.uniform(size=x_np_shape).astype("float32")
+    expected = data.reshape(out_shape)
     params = [x]
     args = [data]
 
@@ -246,7 +250,7 @@ def verify_any_reshape(x_shape, newshape, x_np_shape, out_shape, variable_newsha
     y = relay.reshape(relu_x, newshape=newshape)
     mod = tvm.IRModule()
     mod["main"] = relay.Function(params, y)
-    check_result(args, mod, data, flatten=True)
+    check_result(args, mod, expected)
 
 
 @tvm.testing.uses_gpu
@@ -258,6 +262,8 @@ def test_any_reshape():
     verify_any_reshape(any_dims(3), (0, -2), (2, 3, 4), (2, 3, 4))
     verify_any_reshape(any_dims(3), (-4, -1, 2, -3), (6, 3, 4), (3, 2, 12))
     verify_any_reshape(any_dims(3), (-4, 2, -1, -2), (6, 3, 4), (2, 3, 3, 4))
+    verify_any_reshape(any_dims(3), (1, -1, 0), (2, 3, 4), (1, 6, 4))
+    verify_any_reshape(any_dims(3), (-1, 1, 0), (2, 3, 4), (6, 1, 4))
 
 
 def verify_any_one_hot(indices_shape, indices_np_shape, depth, on_value, off_value, axis, dtype):
@@ -443,6 +449,15 @@ def test_any_layout_transform():
     verify_any_layout_transform((16, 1), "CH", "C4cH", (16, 1), (4, 4, 1))
 
 
+def test_bilayout_with_any():
+    bilayout = tvm.tir.bijective_layout("NCHW", "NHWC")
+    assert isinstance(bilayout, tvm.tir.BijectiveLayout)
+    dst_shape = bilayout.forward_shape((relay.Any(), 32, 7, relay.Any()))
+    assert dst_shape[3] == 32
+    src_shape = bilayout.backward_shape(dst_shape)
+    assert src_shape[1] == 32
+
+
 def verify_any_expand_dims(data_shape, axis, num_newaxis, static_data_shape, ref_out_shape):
     mod = tvm.IRModule()
     dtype = "float32"
@@ -489,6 +504,18 @@ def verify_any_squeeze(data_shape, axis, static_data_shape):
     check_result([data_np], mod, ref_out)
 
 
+def verify_any_squeeze_sqrt(data_shape, axis, static_data_shape):
+    mod = tvm.IRModule()
+    dtype = "float32"
+    data = relay.var("data", shape=data_shape, dtype=dtype)
+    y = relay.squeeze(data, axis=axis)
+    y = relay.sqrt(y)
+    mod["main"] = relay.Function([data], y)
+    data_np = np.random.uniform(size=static_data_shape).astype(dtype)
+    ref_out = np.sqrt(np.squeeze(data_np, axis))
+    check_result([data_np], mod, ref_out)
+
+
 @tvm.testing.uses_gpu
 def test_any_squeeze():
     verify_any_squeeze((relay.Any(), relay.Any(), relay.Any()), (0,), (1, 9, 8))
@@ -496,6 +523,8 @@ def test_any_squeeze():
     verify_any_squeeze(
         (1, relay.Any(), relay.Any(), 1, relay.Any(), relay.Any()), (0, 3), (1, 12, 2, 1, 9, 17)
     )
+    verify_any_squeeze_sqrt((1, relay.Any(), 12, 32, 1), (-1,), (1, 100, 12, 32, 1))
+    verify_any_squeeze_sqrt((relay.Any(), relay.Any(), relay.Any(), 1), (-1,), (1, 9, 8, 1))
 
 
 @tvm.testing.uses_gpu
@@ -522,6 +551,8 @@ def verify_any_conv2d(
     data_layout="NCHW",
     kernel_layout="OIHW",
     use_cudnn=False,
+    targets=None,
+    disable_targets=None,
 ):
     mod = tvm.IRModule()
     dtype = "float32"
@@ -541,11 +572,17 @@ def verify_any_conv2d(
     data_np = np.random.uniform(size=static_data_shape).astype(dtype)
     kernel_np = np.random.uniform(size=kernel_shape).astype(dtype)
 
-    targets = None
-    if use_cudnn and tvm.get_global_func("tvm.contrib.cudnn.conv.output_shape_from_cudnn", True):
+    if use_cudnn and tvm.get_global_func("tvm.contrib.cudnn.conv2d.forward", True):
         targets = [("cuda -libs=cudnn", tvm.cuda(0))]
 
-    check_result([data_np, kernel_np], mod, ref_out_shape, assert_shape=True, targets=targets)
+    check_result(
+        [data_np, kernel_np],
+        mod,
+        ref_out_shape,
+        assert_shape=True,
+        targets=targets,
+        disable_targets=disable_targets,
+    )
 
 
 # TODO(@kevinthesun): Support dynamic input height and width.
@@ -600,6 +637,32 @@ def test_any_conv2d():
         (2, 222, 222, 64),
         data_layout="NHWC",
         kernel_layout="HWIO",
+    )
+
+    if platform.machine() == "aarch64":
+        pytest.skip(
+            reason="Dynamic height and width not supported in arm_cpu. See https://github.com/apache/tvm/issues/16536"
+        )
+
+    verify_any_conv2d(
+        (relay.Any(), 64, relay.Any(), relay.Any()),
+        (64, 64, 3, 3),
+        (1, 1),
+        (1, 1),
+        (1, 1),
+        (1, 64, 224, 224),
+        (1, 64, 224, 224),
+        targets=[("llvm", tvm.cpu(0))],
+    )
+    verify_any_conv2d(
+        (relay.Any(), 64, relay.Any(), relay.Any()),
+        (64, 64, 1, 1),
+        (1, 1),
+        (0, 0),
+        (1, 1),
+        (1, 64, 224, 224),
+        (1, 64, 224, 224),
+        targets=[("llvm", tvm.cpu(0))],
     )
 
 
@@ -926,6 +989,12 @@ class TestAnyDense:
         static_weight_shape,
         ref_out_shape,
     ):
+
+        if platform.machine() == "aarch64":
+            pytest.skip(
+                reason="Dynamic height and width not supported in arm_cpu. See https://github.com/apache/tvm/issues/16536"
+            )
+
         mod = tvm.IRModule()
         dtype = "float32"
         data = relay.var("data", shape=data_shape, dtype=dtype)
@@ -1287,45 +1356,60 @@ def test_arange_with_dynamic_shape():
     check_result([data], mod, np.array(range(10)).astype("int32") + 1)
 
 
-def verify_any_strided_slice(
-    data_shape,
+def verify_any_random_strided_slice(
     begin_shape,
     end_shape,
     strides_shape,
-    data_np_shape,
+    data_shape,
     slice_mode="end",
     const_attrs=False,
 ):
     # Generate random numpy input data
-    np_data = np.random.uniform(size=data_np_shape).astype("float32")
     np_begin = np.random.randint(2, size=begin_shape, dtype="int32")
     np_end = np.random.randint(5, 10, size=end_shape, dtype="int32")
     np_strides = np.random.randint(
         1, 2 if slice_mode == "size" else 3, size=strides_shape, dtype="int32"
     )
+
+    verify_any_strided_slice(
+        np_begin, np_end, np_strides, data_shape, slice_mode=slice_mode, const_attrs=const_attrs
+    )
+
+
+def verify_any_strided_slice(
+    np_begin,
+    np_end,
+    np_strides,
+    data_shape,
+    axes=None,
+    slice_mode="end",
+    const_attrs=False,
+):
+    np_data = np.random.uniform(size=data_shape).astype("float32")
     # target numpy result
     ref_res = tvm.topi.testing.strided_slice_python(
-        np_data, np_begin, np_end, np_strides, slice_mode
+        np_data, np_begin, np_end, np_strides, slice_mode, axes
     )
 
     # Relay Module
     mod = tvm.IRModule()
-    data = relay.var("data", shape=data_shape, dtype="float32")
+    data = relay.var("data", shape=any_dims(len(data_shape)), dtype="float32")
     if const_attrs:
-        data = relay.var("data", shape=data_shape, dtype="float32")
         begin = relay.const(np_begin)
         end = relay.const(np_end)
         strides = relay.const(np_strides)
         args = [data]
         np_inputs = [np_data]
     else:
-        begin = relay.var("begin", shape=begin_shape, dtype="int32")
-        end = relay.var("end", shape=end_shape, dtype="int32")
-        strides = relay.var("strides", shape=strides_shape, dtype="int32")
+        begin = relay.var("begin", shape=np_begin.shape, dtype="int32")
+        end = relay.var("end", shape=np_end.shape, dtype="int32")
+        strides = relay.var("strides", shape=np_strides.shape, dtype="int32")
         args = [data, begin, end, strides]
         np_inputs = [np_data, np_begin, np_end, np_strides]
 
-    y = relay.strided_slice(data, begin=begin, end=end, strides=strides, slice_mode=slice_mode)
+    y = relay.strided_slice(
+        data, begin=begin, end=end, strides=strides, axes=axes, slice_mode=slice_mode
+    )
     mod["main"] = relay.Function(args, y)
 
     check_result(np_inputs, mod, ref_res)
@@ -1333,12 +1417,19 @@ def verify_any_strided_slice(
 
 @tvm.testing.uses_gpu
 def test_any_strided_slice():
-    verify_any_strided_slice(any_dims(2), (2,), (2,), (2,), (15, 21))
-    verify_any_strided_slice(any_dims(3), (3,), (3,), (3,), (15, 17, 21))
-    verify_any_strided_slice(any_dims(3), (3,), (3,), (3,), (23, 29, 41))
-    verify_any_strided_slice(any_dims(4), (4,), (4,), (4,), (40, 50, 60, 70))
-    verify_any_strided_slice(any_dims(3), (3,), (3,), (3,), (15, 17, 21), slice_mode="size")
-    verify_any_strided_slice(any_dims(2), (2,), (2,), (2,), (15, 21), const_attrs=True)
+    verify_any_random_strided_slice((2,), (2,), (2,), (15, 21))
+    verify_any_random_strided_slice((3,), (3,), (3,), (15, 17, 21))
+    verify_any_random_strided_slice((3,), (3,), (3,), (23, 29, 41))
+    verify_any_random_strided_slice((4,), (4,), (4,), (40, 50, 60, 70))
+    verify_any_random_strided_slice((3,), (3,), (3,), (15, 17, 21), slice_mode="size")
+    verify_any_random_strided_slice((2,), (2,), (2,), (15, 21), const_attrs=True)
+
+    begin = np.array([0, 1000000]).astype("int32")
+    end = np.array([1000000, -1000000]).astype("int32")
+    strides = np.array([1, -1]).astype("int32")
+    verify_any_strided_slice(begin, end, strides, (15, 21), const_attrs=False)
+    verify_any_strided_slice(begin, end, strides, (15, 21), const_attrs=True)
+    verify_any_strided_slice(begin, end, strides, (15, 17, 21), axes=[0, 2], const_attrs=True)
 
 
 @tvm.testing.uses_gpu
@@ -1419,10 +1510,14 @@ def test_recursive_concat_with_wrong_annotation():
     start = relay.var("start", shape=(), dtype="int32")
     body = loop(start, relay.op.reshape(relay.const(0), newshape=(1, 1)))
     func = relay.Function([start], relay.TupleGetItem(body, 1))
+
     with DiagnosticTesting() as diagnostics:
         diagnostics.assert_message(
-            "The Relay type checker is unable to show the following types "
-            "match.\nIn particular dimension 0 conflicts: 2 does not match 1."
+            "The Relay type checker is unable to show the following types match:\n"
+            "  Tensor[(2, 1), int32]\n"
+            "  Tensor[(1, 1), int32]\n"
+            "In particular:\n"
+            "  dimension 0 conflicts: 2 does not match 1."
         )
         func = infer_type(func)
 
@@ -1708,16 +1803,19 @@ def test_reshape_concat():
 def test_any_adv_index():
     data = relay.var("data", shape=(5, relay.Any(), relay.Any()), dtype="float32")
     index0 = relay.var("index0", shape=(1, relay.Any()), dtype="int64")
-    index1 = relay.var("index1", shape=(1, relay.Any()), dtype="int64")
+    index1 = relay.var("index1", shape=(relay.Any(), 1), dtype="int64")
     out = relay.adv_index([data, index0, index1])
     mod = tvm.IRModule()
     mod["main"] = relay.Function([data, index0, index1], out)
     np_data_shape = (5, 5, 10)
-    np_index_shape = (1, 4)
+    np_index0_shape = (1, 4)
+    np_index1_shape = (4, 1)
     np_data = np.random.uniform(size=np_data_shape).astype("float32")
-    np_index = np.random.uniform(0, np_data_shape[0], size=np_index_shape).astype("int64")
-    ref_res = np_data[tuple([np_index, np_index])]
-    check_result([np_data, np_index, np_index], mod, ref_res)
+    np_index0 = np.random.uniform(0, np_data_shape[0], size=np_index0_shape).astype("int64")
+    np_index1 = np.random.uniform(0, np_data_shape[0], size=np_index1_shape).astype("int64")
+    ref_res = np_data[tuple([np_index0, np_index1])]
+    print(ref_res.shape)
+    check_result([np_data, np_index0, np_index1], mod, ref_res)
 
 
 def verify_any_repeat(data_shape, np_dshape, repeats, axis):
@@ -2066,6 +2164,29 @@ def test_scatter_nd():
 
 
 @tvm.testing.uses_gpu
+def test_scatter_nd_any_updates():
+    def verify_scatter_nd_any_updates(data_np, indices_np, updates_np, ref_res):
+        indices_shape = (2, relay.Any())
+        updates_shape = (2, relay.Any())
+        data = relay.var("data", shape=data_np.shape, dtype=str(data_np.dtype))
+        indices = relay.var("indices", relay.TensorType(indices_shape, str(indices_np.dtype)))
+        updates = relay.var("updates", relay.TensorType(updates_shape, str(updates_np.dtype)))
+
+        out = relay.op.scatter_nd(data, indices, updates, "add")
+
+        mod = tvm.IRModule()
+        mod["main"] = relay.Function([data, indices, updates], out)
+
+        check_result([data_np, indices_np, updates_np], mod, [ref_res], only_vm=True)
+
+    data = np.zeros((3, 3)).astype("int64")
+    indices = np.array([[1, 1], [0, 1]])
+    updates = np.array([[2, 2], [1, 1]])
+    out = np.array([[0, 0, 0], [0, 0, 0], [2, 2, 1]])
+    verify_scatter_nd_any_updates(data, indices, updates, out)
+
+
+@tvm.testing.uses_gpu
 def test_gather():
     def verify_gather(data_shape, indices_shape, data_shape_np, indices_shape_np, axis):
         x = relay.var("x", relay.TensorType(data_shape, "float32"))
@@ -2118,4 +2239,4 @@ def test_searchsorted():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    tvm.testing.main()

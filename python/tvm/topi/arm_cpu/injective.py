@@ -17,7 +17,6 @@
 # pylint: disable=invalid-name, unused-variable
 """Schedule for pooling operators"""
 import tvm
-import numpy as np
 from tvm import te
 from ..utils import is_empty_shape
 
@@ -68,7 +67,9 @@ def schedule_injective(outs):
 
     if list(s[x].op.axis):
         # do not vectorize for broadcast
-        (io, ii) = s[x].split(list(s[x].op.axis)[-1], 16 // np.dtype(x.dtype).itemsize)
+        dtype = "uint16" if x.dtype == "bfloat16" else x.dtype
+        itemsize = max(1, tvm.DataType(dtype).bits // 8)
+        (io, ii) = s[x].split(list(s[x].op.axis)[-1], 16 // itemsize)
         s[x].vectorize(ii)
     tvm.te.schedule.AutoInlineInjective(s)
 

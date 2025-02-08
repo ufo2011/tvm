@@ -51,7 +51,7 @@ struct Purity {
   bool pure_eval;
   /*!
    * \brief If the sub-expression is first-order then always true. Otherwise true only if evaling
-   * a call to the the sub-expression is pure. See [RULE A] below.
+   * a call to the sub-expression is pure. See [RULE A] below.
    */
   bool pure_call;
 };
@@ -84,7 +84,7 @@ class PurityVisitor : ExprFunctor<Purity(const Expr&)> {
     for (const auto& kv : mod_->functions) {
       if (const auto* function_node = kv.second.as<FunctionNode>()) {
         if (function_node->HasNonzeroAttr(attr::kPrimitive) ||
-            function_node->GetAttr<String>(attr::kExternalSymbol)) {
+            function_node->HasNonzeroAttr(attr::kExtern)) {
           // Ignore primitive and external functions.
           continue;
         }
@@ -133,9 +133,11 @@ class PurityVisitor : ExprFunctor<Purity(const Expr&)> {
 
   Purity VisitExpr_(const GlobalVarNode* global_var_node) final {
     auto global_var = GetRef<GlobalVar>(global_var_node);
+    ICHECK(mod_->ContainGlobalVar(global_var_node->name_hint))
+        << "No definition for '" << global_var_node->name_hint << "'";
     auto func = mod_->Lookup(global_var);
     if (const auto* function_node = func.as<FunctionNode>()) {
-      if (!function_node->GetAttr<String>(attr::kExternalSymbol)) {
+      if (!function_node->HasNonzeroAttr(attr::kExtern)) {
         return VisitGlobalFunction(global_var, GetRef<Function>(function_node));
       }
     }
@@ -184,36 +186,28 @@ class PurityVisitor : ExprFunctor<Purity(const Expr&)> {
   }
 
   Purity VisitExpr_(const CallNode* call_node) final {
+    auto call = GetRef<Call>(call_node);
     if (current_call_depth_ >= kMaxCallDepth) {
       // Assume impure.
       VLOG(2) << "assuming call is impure since too deeply nested";
-      return {/*pure_eval=*/false, /*pure_call*/ IsFirstOrder(GetRef<Call>(call_node))};
+      return {/*pure_eval=*/false, /*pure_call*/ IsFirstOrder(call)};
     }
 
     ++current_call_depth_;
 
-    // We can work with the call in both pre- and post-lowered form.
-    Expr callee;
-    Array<Expr> args;
-    if (call_node->op == CallLoweredOp()) {
-      CallLoweredProps props = GetCallLoweredProps(call_node);
-      callee = props.lowered_func;
-      args = props.arguments;
-    } else {
-      callee = call_node->op;
-      args = call_node->args;
-    }
+    // We can work with calls in both pre- and post-lowered form.
+    Call vanilla_call = GetAnyCall(call_node);
 
     // Find purity for the callee and the args.
-    Purity callee_purity = VisitExpr(callee);
+    Purity callee_purity = VisitExpr(vanilla_call->op);
     bool all_args_pure_eval = true;
-    for (const auto& arg : args) {
+    for (const auto& arg : vanilla_call->args) {
       Purity arg_purity = VisitExpr(arg);
       all_args_pure_eval = all_args_pure_eval && arg_purity.pure_eval;
     }
 
     VLOG(2) << (callee_purity.pure_call ? "pure" : "impure") << " call to:" << std::endl
-            << PrettyPrint(callee);
+            << PrettyPrint(vanilla_call->op);
 
     ICHECK_GT(current_call_depth_, 0);
     --current_call_depth_;
@@ -221,7 +215,7 @@ class PurityVisitor : ExprFunctor<Purity(const Expr&)> {
     // If the callee's result is itself a function then by [RULE A] its purity
     // is given by callee_purity.pure_call.
     return {/*pure_eval=*/all_args_pure_eval && callee_purity.pure_eval && callee_purity.pure_call,
-            /*pure_call=*/IsFirstOrder(GetRef<Call>(call_node)) || callee_purity.pure_call};
+            /*pure_call=*/IsFirstOrder(call) || callee_purity.pure_call};
   }
 
   Purity VisitExpr_(const IfNode* if_node) final {
@@ -542,6 +536,7 @@ namespace transform {
 // Declared in relay/transform.h
 Pass DeadCodeElimination(bool inline_once, bool ignore_impurity) {
   auto pass_func = [=](IRModule mod, PassContext pc) -> IRModule {
+    VLOG(1) << "Before:" << std::endl << PrettyPrint(mod);
     // Which let bindings are pure and can be safely elided?
     std::unordered_map<const VarNode*, bool> var_to_purity;
     if (!ignore_impurity) {
@@ -551,10 +546,11 @@ Pass DeadCodeElimination(bool inline_once, bool ignore_impurity) {
       var_to_purity = purity_visitor.GetPurityMap();
     }
 
-    IRModule result(/*functions=*/{}, mod->type_definitions, mod->Imports(), mod->source_map);
+    IRModule result(/*functions=*/{}, mod->type_definitions, mod->Imports(), mod->source_map,
+                    mod->attrs);
     for (const auto& kv : mod->functions) {
-      if (const auto* function_node = kv.second.as<FunctionNode>()) {
-        auto function = GetRef<Function>(function_node);
+      if (auto opt = kv.second.as<Function>()) {
+        auto function = opt.value();
 
         VLOG(1) << "processing " << PrettyPrint(kv.first);
 
@@ -573,6 +569,7 @@ Pass DeadCodeElimination(bool inline_once, bool ignore_impurity) {
         result->Add(kv.first, kv.second);
       }
     }
+    VLOG(1) << "After:" << std::endl << PrettyPrint(result);
 
     return result;
   };

@@ -17,13 +17,12 @@
 
 """Sparse operators"""
 import numpy as np
-import scipy.sparse as sp
 
 import tvm
 from tvm import relay, te
 
 from .. import nn
-from ..utils import traverse_inline, get_const_tuple, prod, get_const_int, ceil_div
+from ..utils import ceil_div, get_const_int, get_const_tuple, prod, traverse_inline
 from .transform import schedule_transpose_from_existing
 
 
@@ -131,8 +130,8 @@ def sparse_dense_tir(data, w_data, w_indices, w_indptr):
         # pylint: disable=invalid-name, simplifiable-if-statement
         # TODO(tkonolige): use tensorcores for block multiply
         # TODO(tkonolige): use vectorize on loads
-        # TODO(tkonolige): seperate implementation if M is small
-        # TODO(tkonolige): seperate implementation for large block sizes
+        # TODO(tkonolige): separate implementation if M is small
+        # TODO(tkonolige): separate implementation for large block sizes
         ib = tvm.tir.ir_builder.create()
 
         if tvm.target.Target.current(allow_none=False).kind.name == "cuda":
@@ -149,7 +148,6 @@ def sparse_dense_tir(data, w_data, w_indices, w_indptr):
         warp_size = int(tvm.target.Target.current(allow_none=False).thread_warp_size)
         m = data.shape[1]
         nb = w_indptr.shape[0] - 1
-        nnzb = w_data.shape[0]
         # treat csr like block size 1 bsr
         if len(w_data.shape) == 1:
             bs_n = 1
@@ -160,10 +158,9 @@ def sparse_dense_tir(data, w_data, w_indices, w_indptr):
         bs_m = bs_n
         mb = m // bs_m
         mi = warp_size
-        assert (
-            mb >= mi
-        ), "Number of block rows in dense matrix must be larger than warp size: {} vs {}.".format(
-            warp_size, mb
+        assert mb >= mi, (
+            f"Number of block rows in dense matrix must be larger than warp size: "
+            f"{warp_size} vs {mb}."
         )
         mo = ceil_div(mb, mi)
         ni = 1  # TODO(tkonolige): how do I compute the number of warps per block?
@@ -181,7 +178,7 @@ def sparse_dense_tir(data, w_data, w_indices, w_indptr):
 
         out_ptr = ib.buffer_ptr(out)
         data_ptr = ib.buffer_ptr(data)
-        w_data_ptr = ib.buffer_ptr(w_data, shape=(nnzb, bs_n, bs_k))
+        w_data_ptr = ib.buffer_ptr(w_data)
         w_indices_ptr = ib.buffer_ptr(w_indices)
         w_indptr_ptr = ib.buffer_ptr(w_indptr)
 
@@ -238,10 +235,11 @@ def sparse_dense_tir(data, w_data, w_indices, w_indptr):
             elem_idx = bb * rowlength_bi + tx
             with ib.for_range(0, bs_n, name="y", kind="unroll") as y:
                 with ib.for_range(0, bs_k, name="z", kind="unroll") as z:
-                    if use_warp_storage:
-                        w_data_cache[tx, y, z] = w_data_ptr[row_start + elem_idx, y, z]
-                    else:
-                        w_data_cache[warp, tx, y, z] = w_data_ptr[row_start + elem_idx, y, z]
+                    data_indices = [row_start + elem_idx] + (
+                        [y, z] if len(w_data.shape) > 1 else []
+                    )
+                    cache_indices = [tx, y, z] if use_warp_storage else [warp, tx, y, z]
+                    w_data_cache[cache_indices] = w_data_ptr[data_indices]
             with ib.for_range(0, mi, name="i") as i:
                 # thread local block matmul
                 with ib.for_range(0, bs_m, name="x", kind="unroll") as x:
@@ -359,6 +357,8 @@ def schedule_sparse_dense_padded(outs):
 
 def pad_sparse_matrix(matrix, blocksize):
     """Pad rows of sparse matrix matrix so that they are a multiple of blocksize."""
+    import scipy.sparse as sp  # pylint: disable=import-outside-toplevel
+
     assert isinstance(matrix, sp.bsr_matrix)
     new_entries = np.zeros(matrix.shape[0], dtype=matrix.indptr.dtype)
     bsr = matrix.blocksize[0]
@@ -395,6 +395,8 @@ def _alter_sparse_dense_layout(_attrs, inputs, _tinfos, _out_type):
     sparse_dense implementation for one that operates on a padded matrix. We
     also pad the matrix.
     """
+    import scipy.sparse as sp  # pylint: disable=import-outside-toplevel
+
     # TODO(ANSHUMAN87): Handle for sparse_lhs case too
     if (
         isinstance(inputs[1], relay.Constant)

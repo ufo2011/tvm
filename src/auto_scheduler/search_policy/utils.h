@@ -48,27 +48,29 @@ namespace auto_scheduler {
 
 /*! \brief Return whether the search task is targeting a CPU. */
 inline bool IsCPUTask(const SearchTask& task) {
-  return (task)->target->kind->device_type == kDLCPU;
+  return (task)->target->GetTargetDeviceType() == kDLCPU;
 }
 
 /*! \brief Return whether the search task is targeting a GPU. */
 inline bool IsGPUTask(const SearchTask& task) {
-  return (task)->target->kind->device_type == kDLCUDA ||
-         (task)->target->kind->device_type == kDLOpenCL ||
-         (task)->target->kind->device_type == kDLVulkan ||
-         (task)->target->kind->device_type == kDLMetal ||
-         (task)->target->kind->device_type == kDLROCM ||
-         (task)->target->kind->device_type == kOpenGL;
+  int device_type = (task)->target->GetTargetDeviceType();
+  return device_type == kDLCUDA || device_type == kDLOpenCL || device_type == kDLVulkan ||
+         device_type == kDLMetal || device_type == kDLROCM || device_type == kOpenGL;
+}
+
+/*! \brief Return whether the search task is targeting a Hexagon. */
+inline bool IsHexagonTask(const SearchTask& task) {
+  return (task)->target->GetTargetDeviceType() == kDLHexagon;
 }
 
 /*! \brief Return whether the search task is targeting a CUDA GPU. */
 inline bool IsCUDATask(const SearchTask& task) {
-  return (task)->target->kind->device_type == kDLCUDA;
+  return (task)->target->GetTargetDeviceType() == kDLCUDA;
 }
 
 /*! \brief Return whether the search task is targeting a OpenCL GPU. */
 inline bool IsOpenCLTask(const SearchTask& task) {
-  return (task)->target->kind->device_type == kDLOpenCL;
+  return (task)->target->GetTargetDeviceType() == kDLOpenCL;
 }
 
 /*! \brief Argsort. Order: largest to smallest */
@@ -92,7 +94,6 @@ inline int OperationToStage(const te::Operation& op, const State& state) {
     }
   }
   LOG(FATAL) << "Cannot find op: " << op;
-  return -1;
 }
 
 /********** Get Parameters **********/
@@ -100,7 +101,7 @@ inline int OperationToStage(const te::Operation& op, const State& state) {
 /*! \brief Get an integer from a tvm str Map. */
 inline int GetIntParam(const Map<String, ObjectRef>& attr_dict, const std::string& key) {
   ICHECK_GT(attr_dict.count(key), 0) << "Cannot find key: \"" << key << "\" in " << attr_dict;
-  auto pint = attr_dict[key].as<IntImmNode>();
+  auto pint = attr_dict[key].as<runtime::Int::ContainerType>();
   ICHECK(pint != nullptr);
   return pint->value;
 }
@@ -108,7 +109,7 @@ inline int GetIntParam(const Map<String, ObjectRef>& attr_dict, const std::strin
 /*! \brief Get a double from a tvm str Map. */
 inline double GetDoubleParam(const Map<String, ObjectRef>& attr_dict, const std::string& key) {
   ICHECK_GT(attr_dict.count(key), 0) << "Cannot find key: \"" << key << "\" in " << attr_dict;
-  auto pdouble = attr_dict[key].as<FloatImmNode>();
+  auto pdouble = attr_dict[key].as<runtime::Float::ContainerType>();
   ICHECK(pdouble != nullptr);
   return pdouble->value;
 }
@@ -119,10 +120,12 @@ inline std::string GetStringParam(const Map<String, ObjectRef>& attr_dict, const
   const auto& target = attr_dict[key];
   if (auto pstr = target.as<StringImmNode>()) {
     return pstr->value;
+  } else if (auto pstr = target.as<StringObj>()) {
+    return pstr->data;
+  } else {
+    LOG(FATAL) << "Could not convert object " << target << " of type " << target->GetTypeKey()
+               << " to string";
   }
-  auto pstr = target.as<StringObj>();
-  ICHECK(pstr != nullptr);
-  return pstr->data;
 }
 
 /*! \brief Get a iterator name set from a tvm str Map. */
@@ -534,7 +537,6 @@ inline Iterator GetLastReduceIteratorInOutermostReduceTile(const Stage& stage) {
   }
 
   LOG(FATAL) << "Cannot find the iterator.";
-  return stage->iters[0];
 }
 
 /*! \brief Get the target stage id of a history step in the new state.
@@ -628,7 +630,7 @@ inline Array<State> RandomSampleStates(const Array<State>& in_states, std::mt199
   return out_states;
 }
 
-/*! \brief Compute prefix-sum probabiilty based on the given weights */
+/*! \brief Compute prefix-sum probability based on the given weights */
 inline void ComputePrefixSumProb(const std::vector<float>& weights,
                                  std::vector<double>* prefix_sum_probs) {
   // Compute selection probabilities.

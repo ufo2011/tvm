@@ -18,11 +18,13 @@
    for expressions.
 """
 import pytest
-import tvm
+import numpy as np
 
-from tvm import IRModule, te, relay, parser
-from tvm.relay import op, transform, analysis
+import tvm
+from tvm import IRModule, relay
+from tvm.relay import op, transform
 from tvm.relay.op import op as _op
+from tvm.script import tir as T
 
 
 def infer_mod(mod, annotate_spans=True):
@@ -33,12 +35,9 @@ def infer_mod(mod, annotate_spans=True):
     return mod
 
 
-def infer_expr(expr, annotate_spans=True):
-    mod = IRModule.from_expr(expr)
-    mod = infer_mod(mod, annotate_spans)
-    mod = transform.InferType()(mod)
-    entry = mod["main"]
-    return entry if isinstance(expr, relay.Function) else entry.body
+def infer_expr(expr):
+    transform.InferTypeLocal(expr)
+    return expr
 
 
 def assert_has_type(expr, typ, mod=None):
@@ -68,7 +67,7 @@ def test_monomorphic_let():
     # TODO(@jroesch): this seems whack.
     sb = relay.ScopeBuilder()
     x = relay.var("x", dtype="float64", shape=())
-    x = sb.let("x", relay.const(1.0, "float64"))
+    x = sb.let(x, relay.const(1.0, "float64"))
     sb.ret(x)
     xchecked = infer_expr(sb.get())
     assert xchecked.checked_type == relay.scalar_type("float64")
@@ -165,11 +164,11 @@ def test_recursion():
 def test_incomplete_call():
     tt = relay.scalar_type("int32")
     x = relay.var("x", tt)
+    f_type = relay.FuncType([tt], tt)
     f = relay.var("f")
     func = relay.Function([x, f], relay.Call(f, [x]), tt)
 
     ft = infer_expr(func)
-    f_type = relay.FuncType([tt], tt)
     assert ft.checked_type == relay.FuncType([tt, f_type], tt)
 
 
@@ -245,8 +244,8 @@ def test_ref():
 def test_free_expr():
     x = relay.var("x", "float32")
     y = relay.add(x, x)
-    yy = infer_expr(y, annotate_spans=False)
-    assert tvm.ir.structural_equal(yy.args[0], x, map_free_vars=True)
+    yy = infer_expr(y)
+    tvm.ir.assert_structural_equal(yy.args[0], x, map_free_vars=True)
     assert yy.checked_type == relay.scalar_type("float32")
     assert x.vid.same_as(yy.args[0].vid)
 
@@ -255,8 +254,11 @@ def test_type_args():
     x = relay.var("x", shape=(10, 10))
     y = relay.var("y", shape=(1, 10))
     z = relay.add(x, y)
-    ty_z = infer_expr(z)
-    ty_args = ty_z.type_args
+
+    # InferTypeLocal does not support populating the type_args field
+    mod = infer_mod(IRModule.from_expr(z))
+    mod = infer_mod(mod, annotate_spans=False)
+    ty_args = mod["main"].body.type_args
     assert len(ty_args) == 2
     assert ty_args[0].dtype == "float32"
     assert ty_args[1].dtype == "float32"
@@ -398,7 +400,7 @@ def @main(%f: float32) -> float32 {
   @id(%f)
 }
 """
-    mod = tvm.parser.fromtext(code)
+    mod = tvm.relay.fromtext(code)
     mod = transform.InferType()(mod)
     tvm.ir.assert_structural_equal(mod["main"].body.type_args, [relay.TensorType((), "float32")])
 
@@ -415,6 +417,14 @@ def test_dynamic_function():
     mod["main"] = relay.Function([y], c)
     mod = transform.InferType()(mod)
     assert mod["main"].params[0].checked_type == s_tt
+
+    data = relay.var(
+        "data", shape=(relay.Any(), relay.Any(), relay.Any(), relay.Any()), dtype="float32"
+    )
+    weigth = relay.const(np.full((16, 16, 3, 3), 0.25), dtype="float32")
+    x = relay.nn.conv2d(data, weigth, kernel_size=(3, 3), channels=16, groups=2)
+    mod = tvm.IRModule.from_expr(x)
+    mod = transform.InferType()(mod)
 
 
 def test_custom_op_infer():
@@ -532,7 +542,7 @@ def test_custom_op_rel_infer_exception():
     t2 = sb.let("t2", relay.add(t1, x))
     sb.ret(t2)
     f = relay.Function([x], sb.get())
-    with pytest.raises(tvm.error.TVMError) as cm:
+    with pytest.raises(AssertionError) as cm:
         fchecked = infer_expr(f)
         assert "type relation arg number mismatch" in str(cm.execption)
 
@@ -545,7 +555,33 @@ def test_repeat_register():
         assert "Operator custom_log3 is registered before" in str(cm.execption)
 
 
-if __name__ == "__main__":
-    import sys
+@pytest.mark.parametrize("relay_op", [relay.op.argmax, relay.op.argmin])
+@pytest.mark.parametrize(
+    "shape_dtype",
+    [
+        ("int32", T.int32),
+        ("int64", T.int64),
+    ],
+    ids=["int32", "int64"],
+)
+def test_argreduce_infer_return_type(relay_op, shape_dtype):
+    x_shape = (1, 1)
+    broadcast_shape = [1, 1]
+    (sdtype, conv) = shape_dtype
 
-    pytest.main(sys.argv)
+    x = relay.var("data", relay.TensorType(x_shape, "float32"))
+    broadcast_to = relay.op.broadcast_to(x, relay.const(broadcast_shape, dtype=sdtype))
+    argmax = relay_op(broadcast_to, axis=[1])
+
+    f = relay.Function([x], argmax)
+    assert_has_type(
+        f,
+        relay.FuncType(
+            [relay.TensorType(broadcast_shape, "float32")],
+            relay.TensorType([conv(1)], dtype=sdtype),
+        ),
+    )
+
+
+if __name__ == "__main__":
+    tvm.testing.main()

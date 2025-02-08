@@ -15,50 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 """Round Robin Task Scheduler"""
-
-from typing import List, TYPE_CHECKING
-
 from tvm._ffi import register_object
 
-from ..builder import Builder
-from ..runner import Runner
-from ..database import Database
+from .. import _ffi_api
+from ..logging import get_logger, get_logging_func
 from .task_scheduler import TaskScheduler
 
-from .. import _ffi_api
-
-if TYPE_CHECKING:
-    from ..tune_context import TuneContext
+logger = get_logger(__name__)  # pylint: disable=invalid-name
 
 
 @register_object("meta_schedule.RoundRobin")
 class RoundRobin(TaskScheduler):
     """Round Robin Task Scheduler"""
 
-    def __init__(
-        self,
-        tasks: List["TuneContext"],
-        builder: Builder,
-        runner: Runner,
-        database: Database,
-    ) -> None:
-        """Constructor.
-
-        Parameters
-        ----------
-        tasks : List[TuneContext]
-            List of tasks to schedule.
-        builder : Builder
-            The builder.
-        runner : Runner
-            The runner.
-        database : Database
-            The database.
-        """
+    def __init__(self) -> None:
+        """Constructor."""
         self.__init_handle_by_constructor__(
             _ffi_api.TaskSchedulerRoundRobin,  # type: ignore # pylint: disable=no-member
-            tasks,
-            builder,
-            runner,
-            database,
+            get_logging_func(logger),
         )

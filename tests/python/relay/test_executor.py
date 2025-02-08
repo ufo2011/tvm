@@ -23,12 +23,12 @@ from tvm.relay.backend import Executor
 
 def test_create_executor():
     executor = Executor("aot")
-    assert str(executor) == "aot"
+    assert executor.name == "aot"
 
 
 def test_create_executor_with_options():
     executor = Executor("aot", {"interface-api": "c"})
-    assert str(executor) == "aot"
+    assert executor.name == "aot"
     assert executor["interface-api"] == "c"
 
 
@@ -57,7 +57,7 @@ def test_create_executor_attr_type_incorrect():
     with pytest.raises(
         TVMError,
         match='Attribute "interface-api" should have type "runtime.String"'
-        ' but instead found "IntImm"',
+        ' but instead found "runtime.BoxBool"',
     ):
         Executor("aot", {"interface-api": True})
 
@@ -66,7 +66,7 @@ def test_list_executors():
     assert "aot" in Executor.list_registered()
 
 
-@pytest.mark.parametrize("executor", [Executor("aot"), "aot"])
+@pytest.mark.parametrize("executor", [Executor("aot").name, "aot"])
 def test_list_executor_options(executor):
     aot_options = Executor.list_registered_options(executor)
     assert "interface-api" in aot_options

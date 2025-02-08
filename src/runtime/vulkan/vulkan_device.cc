@@ -132,6 +132,10 @@ VulkanDeviceProperties::VulkanDeviceProperties(const VulkanInstance& instance,
       device.HasExtension("VK_KHR_dedicated_allocation") &&
       !support::BoolEnvironmentVar("TVM_VULKAN_DISABLE_DEDICATED_ALLOCATION");
 
+  supports_integer_dot_product = device.HasExtension("VK_KHR_shader_integer_dot_product");
+
+  supports_cooperative_matrix = device.HasExtension("VK_NV_cooperative_matrix");
+
   // The check of VK_SHADER_STAGE_COMPUTE_BIT isn't technically
   // needed, since it will be set so long at least one queue has
   // VK_QUEUE_COMPUTE_BIT.  Including it to avoid potential future
@@ -142,7 +146,11 @@ VulkanDeviceProperties::VulkanDeviceProperties(const VulkanInstance& instance,
   max_num_threads = properties.properties.limits.maxComputeWorkGroupInvocations;
 
   // Even if we can't query it, warp size must be at least 1.
-  thread_warp_size = std::max(subgroup.subgroupSize, 1U);
+  // thread_warp_size = std::max(subgroup.subgroupSize, 1U);
+  // vulkan's subgroup may not directly map to warp and atm
+  // can cause issues in softmax allreduce in NVidia GPU
+  // disable warp setting to be safe.
+  thread_warp_size = 1U;
 
   max_block_size_x = properties.properties.limits.maxComputeWorkGroupSize[0];
   max_block_size_y = properties.properties.limits.maxComputeWorkGroupSize[1];
@@ -226,6 +234,12 @@ VulkanGetBufferMemoryRequirements2Functions::VulkanGetBufferMemoryRequirements2F
       vkGetDeviceProcAddr(device, "vkGetBufferMemoryRequirements2KHR"));
 }
 
+VulkanQueueInsertDebugUtilsLabelFunctions::VulkanQueueInsertDebugUtilsLabelFunctions(
+    VkInstance instance) {
+  vkQueueInsertDebugUtilsLabelEXT = (PFN_vkQueueInsertDebugUtilsLabelEXT)ICHECK_NOTNULL(
+      vkGetInstanceProcAddr(instance, "vkQueueInsertDebugUtilsLabelEXT"));
+}
+
 VulkanDevice::VulkanDevice(const VulkanInstance& instance, VkPhysicalDevice phy_device)
     : physical_device_(phy_device) {
   queue_family_index = SelectComputeQueueFamily();
@@ -279,7 +293,7 @@ VulkanDevice::VulkanDevice(const VulkanInstance& instance, VkPhysicalDevice phy_
 
   for (uint32_t k = 0; k < prop.memoryTypeCount; ++k) {
     VkMemoryType ty = prop.memoryTypes[k];
-    size_t heap_size = prop.memoryHeaps[ty.heapIndex].size;
+    int64_t heap_size = static_cast<int64_t>(prop.memoryHeaps[ty.heapIndex].size);
     // host visible
     if (!(ty.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
     // match copy requirment
@@ -298,7 +312,7 @@ VulkanDevice::VulkanDevice(const VulkanInstance& instance, VkPhysicalDevice phy_
   win_rank = -1;
   for (uint32_t k = 0; k < prop.memoryTypeCount; ++k) {
     VkMemoryType ty = prop.memoryTypes[k];
-    size_t heap_size = prop.memoryHeaps[ty.heapIndex].size;
+    int64_t heap_size = static_cast<int64_t>(prop.memoryHeaps[ty.heapIndex].size);
     // host visible
     if (!(ty.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
     // match copy requirment
@@ -310,8 +324,10 @@ VulkanDevice::VulkanDevice(const VulkanInstance& instance, VkPhysicalDevice phy_
     if (rank > win_rank) {
       win_rank = rank;
       compute_mtype_index = k;
+      compute_memory_size = heap_size;
     }
   }
+
   ICHECK_GE(win_rank, 0) << "Cannot find suitable local memory on device.";
 
   if (device_properties.supports_push_descriptor) {
@@ -322,6 +338,11 @@ VulkanDevice::VulkanDevice(const VulkanInstance& instance, VkPhysicalDevice phy_
   if (device_properties.supports_dedicated_allocation) {
     get_buffer_memory_requirements_2_functions =
         std::make_unique<VulkanGetBufferMemoryRequirements2Functions>(device_);
+  }
+
+  if (instance.HasExtension("VK_EXT_debug_utils")) {
+    queue_insert_debug_utils_label_functions =
+        std::make_unique<VulkanQueueInsertDebugUtilsLabelFunctions>(instance);
   }
 }
 
@@ -361,7 +382,10 @@ void VulkanDevice::do_swap(VulkanDevice&& other) {
   std::swap(descriptor_template_khr_functions, other.descriptor_template_khr_functions);
   std::swap(get_buffer_memory_requirements_2_functions,
             other.get_buffer_memory_requirements_2_functions);
+  std::swap(queue_insert_debug_utils_label_functions,
+            other.queue_insert_debug_utils_label_functions);
   std::swap(compute_mtype_index, other.compute_mtype_index);
+  std::swap(compute_memory_size, other.compute_memory_size);
   std::swap(queue, other.queue);
   std::swap(queue_family_index, other.queue_family_index);
   std::swap(physical_device_, other.physical_device_);
@@ -410,18 +434,18 @@ uint32_t VulkanDevice::SelectComputeQueueFamily() const {
 
 std::vector<const char*> VulkanDevice::SelectEnabledExtensions() const {
   std::vector<const char*> required_extensions{};
-  std::vector<const char*> optional_extensions{
-      "VK_KHR_driver_properties",
-      "VK_KHR_storage_buffer_storage_class",
-      "VK_KHR_8bit_storage",
-      "VK_KHR_16bit_storage",
-      "VK_KHR_shader_float16_int8",
-      "VK_KHR_push_descriptor",
-      "VK_KHR_descriptor_update_template",
-      "VK_KHR_get_memory_requirements2",
-      "VK_KHR_dedicated_allocation",
-      "VK_KHR_spirv_1_4",
-  };
+  std::vector<const char*> optional_extensions{"VK_KHR_driver_properties",
+                                               "VK_KHR_storage_buffer_storage_class",
+                                               "VK_KHR_8bit_storage",
+                                               "VK_KHR_16bit_storage",
+                                               "VK_KHR_shader_float16_int8",
+                                               "VK_KHR_push_descriptor",
+                                               "VK_KHR_descriptor_update_template",
+                                               "VK_KHR_get_memory_requirements2",
+                                               "VK_KHR_dedicated_allocation",
+                                               "VK_KHR_spirv_1_4",
+                                               "VK_KHR_shader_integer_dot_product",
+                                               "VK_NV_cooperative_matrix"};
 
   uint32_t device_extension_prop_count;
   VULKAN_CALL(vkEnumerateDeviceExtensionProperties(physical_device_, nullptr,
@@ -576,7 +600,6 @@ uint32_t FindMemoryType(const VulkanDevice& device, VkBufferCreateInfo info,
     type_bits >>= 1;
   }
   LOG(FATAL) << "Requested memory type not found";
-  return 0;
 }
 
 VulkanHostVisibleBuffer* GetOrAllocate(

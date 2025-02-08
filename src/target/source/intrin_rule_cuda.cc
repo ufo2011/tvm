@@ -40,13 +40,29 @@ struct CUDAMath {
           return name;
         case 32:
           return name + 'f';
-        case 16:
-          return 'h' + name;
+        case 16: {
+          if (name == "fabs") {
+            return "__habs";
+          } else if (name == "round") {
+            return "hrint";
+          } else {
+            return "h" + name;
+          }
+        }
         default:
           return "";
       }
     } else if (t.is_bfloat16()) {
       return 'h' + name;
+    } else if (t.is_int() || t.is_uint()) {
+      switch (t.bits()) {
+        case 32:
+          return "__" + name;
+        case 64:
+          return "__" + name + "ll";
+        default:
+          return "";
+      }
     }
     return "";
   }
@@ -74,7 +90,7 @@ struct CUDAFastMathTan : public CUDAMath {
         case 32:
           return name + 'f';
         case 16:
-          LOG(FATAL) << "cuda tan unsupported for float16";
+          return 'h' + name;
         default:
           return "";
       }
@@ -126,6 +142,9 @@ static PrimExpr DispatchCUDAShuffle(const PrimExpr& e) {
   return Call(call->dtype, T()(call->dtype, Downcast<Op>(call->op)), cuda_args);
 }
 
+TVM_REGISTER_OP("tir.clz").set_attr<FLowerIntrinsic>(
+    "cuda.FLowerIntrinsic", DispatchPureExtern<CUDAMath, /*dtype_from_arg=*/true>);
+
 TVM_REGISTER_OP("tir.floor")
     .set_attr<FLowerIntrinsic>("cuda.FLowerIntrinsic", DispatchPureExtern<CUDAMath>);
 
@@ -139,6 +158,9 @@ TVM_REGISTER_OP("tir.fabs")
     .set_attr<FLowerIntrinsic>("cuda.FLowerIntrinsic", DispatchPureExtern<CUDAMath>);
 
 TVM_REGISTER_OP("tir.round")
+    .set_attr<FLowerIntrinsic>("cuda.FLowerIntrinsic", DispatchPureExtern<CUDAMath>);
+
+TVM_REGISTER_OP("tir.nearbyint")
     .set_attr<FLowerIntrinsic>("cuda.FLowerIntrinsic", DispatchPureExtern<CUDAMath>);
 
 TVM_REGISTER_OP("tir.exp").set_attr<FLowerIntrinsic>("cuda.FLowerIntrinsic",

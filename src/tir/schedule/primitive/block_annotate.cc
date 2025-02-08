@@ -16,6 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+#include <tvm/tir/expr.h>
+
+#include "../../transforms/ir_utils.h"
 #include "../utils.h"
 
 namespace tvm {
@@ -63,44 +66,6 @@ class StorageAlignAxisOutOfRangeError : public ScheduleError {
   int axis_;
 };
 
-/*!
- * \brief Find the defining site of the buffer in the given block and its ancestors
- * \param block_sref The block sref
- * \param buffer The buffer
- * \return The defining site of the buffer and whether the buffer is allocated (otherwise the
- *         buffer is from match_buffer).
- */
-std::pair<Optional<StmtSRef>, bool> GetBufferDefiningSite(const StmtSRef& block_sref,
-                                                          const Buffer& buffer) {
-  // Climb up along the sref tree, and find the block where `buffer` is in alloc_buffers or
-  // match_buffers.
-  const StmtSRefNode* defining_site_sref = block_sref.get();
-  while (defining_site_sref != nullptr) {
-    const auto* block = defining_site_sref->StmtAs<BlockNode>();
-    // If this sref is not a block sref, skip it.
-    if (block == nullptr) {
-      defining_site_sref = defining_site_sref->parent;
-      continue;
-    }
-    // Try to find the buffer in `allloc_buffers`
-    for (const Buffer& alloc_buffer : block->alloc_buffers) {
-      if (buffer.same_as(alloc_buffer)) {
-        return {GetRef<StmtSRef>(defining_site_sref), true};
-      }
-    }
-    // We do not allow the buffer being defined in `match_buffer`.
-    for (const MatchBufferRegion match_buffer : block->match_buffers) {
-      if (buffer.same_as(match_buffer)) {
-        return {GetRef<StmtSRef>(defining_site_sref), false};
-      }
-    }
-    defining_site_sref = defining_site_sref->parent;
-  }
-  // If we cannot find the defining site block, it means that the buffer must be in the function's
-  // buffer_map, which isn't an intermediate buffer.
-  return {NullOpt, false};
-}
-
 class NonAllocatedBufferError : public ScheduleError {
  public:
   explicit NonAllocatedBufferError(IRModule mod, Buffer buffer) : mod_(mod), buffer_(buffer) {}
@@ -118,14 +83,14 @@ class NonAllocatedBufferError : public ScheduleError {
     return os.str();
   }
 
-  static void CheckBufferAllocated(const IRModule& mod, const StmtSRef& block_sref,
-                                   const Buffer& buffer) {
-    Optional<StmtSRef> defining_site_sref;
-    bool is_alloc;
-    std::tie(defining_site_sref, is_alloc) = GetBufferDefiningSite(block_sref, buffer);
-    if (!defining_site_sref || !is_alloc) {
+  static StmtSRef CheckAndGetBufferAllocationSite(const IRModule& mod, const StmtSRef& block_sref,
+                                                  const Buffer& buffer) {
+    auto [defining_site_sref, is_alloc] = GetBufferDefiningSite(block_sref, buffer);
+    if (!defining_site_sref.defined() || !is_alloc) {
       throw NonAllocatedBufferError(mod, buffer);
     }
+
+    return defining_site_sref.value();
   }
 
   Array<ObjectRef> LocationsOfInterest() const final { return {}; }
@@ -233,14 +198,53 @@ class StorageAlignInvalidAnnotationError : public ScheduleError {
   Block block_;
 };
 
+/*!
+ * \brief A helper mutator which recursively mutates the old buffer's storage scope and collects
+ * the block sref reuse information for the following replacement.
+ */
+class StorageScopeMutator : private ReplaceBufferMutator {
+ public:
+  /*!
+   * \param allocate_site The block where `old_buffer` was allocated.
+   * \param old_buffer The old buffer
+   * \param storage_scope The storage scope to be set
+   * \param block_sref_reuse The block sref reuse map to be updated
+   * \return The new block after the mutation
+   */
+  static Block Mutate(const Block& allocate_site, const Buffer& old_buffer,
+                      const String& storage_scope, Map<Block, Block>* block_sref_reuse) {
+    Buffer new_buffer = WithScope(old_buffer, storage_scope);
+    StorageScopeMutator mutator(old_buffer, new_buffer, storage_scope, block_sref_reuse);
+    Stmt new_block = mutator.VisitStmt(allocate_site);
+    return Downcast<Block>(new_block);
+  }
+
+ private:
+  StorageScopeMutator(const Buffer& old_buffer, Buffer new_buffer, String storage_scope,
+                      Map<Block, Block>* block_sref_reuse)
+      : ReplaceBufferMutator(old_buffer, std::move(new_buffer), block_sref_reuse) {}
+
+  MatchBufferRegion VisitMatchBufferRegion(const MatchBufferRegion& match_buffer) final {
+    auto it = buffer_var_map_.find(match_buffer->source->buffer->data.get());
+    if (it != buffer_var_map_.end()) {
+      Buffer new_target_buffer = WithScope(match_buffer->buffer, it->second.scope());
+      buffer_var_map_[match_buffer->buffer->data.get()] = new_target_buffer;
+      return MatchBufferRegion(new_target_buffer,
+                               BufferRegion(it->second, match_buffer->source->region));
+    } else {
+      return match_buffer;
+    }
+  }
+};
+
 void StorageAlign(ScheduleState self, const StmtSRef& block_sref, int buffer_index, int axis,
                   int factor, int offset) {
-  const BlockNode* block_ptr = TVM_SREF_TO_BLOCK(block_ptr, block_sref);
+  const BlockNode* block_ptr = TVM_SREF_TO_BLOCK(block_sref);
   Buffer buffer =
-      GetNthAccessBuffer(self, GetRef<Block>(block_ptr), buffer_index, /*is_write=*/true);
+      GetNthAccessBuffer(self, GetRef<Block>(block_ptr), buffer_index, BufferIndexType::kWrite);
   StorageAlignInvalidFactorError::Check(self->mod, factor);
   axis = StorageAlignAxisOutOfRangeError::CheckAndUpdate(self->mod, buffer, axis);
-  NonAllocatedBufferError::CheckBufferAllocated(self->mod, block_sref, buffer);
+  NonAllocatedBufferError::CheckAndGetBufferAllocationSite(self->mod, block_sref, buffer);
 
   // Step 1: Get existing or create new annotation value.
   StorageAlignAnnotation storage_align_annotation =
@@ -267,6 +271,120 @@ void StorageAlign(ScheduleState self, const StmtSRef& block_sref, int buffer_ind
   // Step 3: Replace the block with the new annotation
   Block new_block = WithAnnotation(block_ptr, attr::buffer_dim_align, storage_align_annotation);
   self->Replace(block_sref, new_block, {{GetRef<Block>(block_ptr), new_block}});
+}
+
+void SetScope(ScheduleState self, const StmtSRef& block_sref, int buffer_index,
+              const String& storage_scope) {
+  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  Buffer buffer =
+      GetNthAccessBuffer(self, GetRef<Block>(block), buffer_index, BufferIndexType::kWrite);
+
+  // Step 1. If `storage_scope` equals the original storage scope of the buffer, just return.
+  if (buffer.scope() == storage_scope) {
+    return;
+  }
+
+  // Step 2. Throw an error if the input storage scope is invalid.
+  CheckStorageScope(self, storage_scope);
+
+  // Step 3. Get the allocation site of the target buffer.
+  StmtSRef alloc_site_sref =
+      NonAllocatedBufferError::CheckAndGetBufferAllocationSite(self->mod, block_sref, buffer);
+  const BlockNode* alloc_site = TVM_SREF_TO_BLOCK(alloc_site_sref);
+
+  // Step 4. Recursively replace the old buffer to a new buffer, where the new buffer has the given
+  // storage scope. In the meanwhile, collect the block sref reuse information.
+  Map<Block, Block> block_reuse_map;
+  Block new_block = StorageScopeMutator::Mutate(GetRef<Block>(alloc_site), buffer, storage_scope,
+                                                &block_reuse_map);
+  self->Replace(alloc_site_sref, new_block, block_reuse_map);
+}
+
+/*!
+ * \brief A helper mutator which recursively mutates the old buffer's data type, inserts data type
+ * conversions, and collecte the block sref reuse information for the following replacement.
+ */
+class DTypeMutator : private ReplaceBufferMutator {
+ public:
+  /*!
+   * \param allocate_site The block where `old_buffer` was allocated.
+   * \param old_buffer The old buffer
+   * \param target_dtype The data type to be set
+   * \param block_sref_reuse The block sref reuse map to be updated
+   * \return The new block after the mutation
+   */
+  static Block Mutate(const Block& allocate_site, const Buffer& old_buffer, const DataType& dtype,
+                      Map<Block, Block>* block_sref_reuse) {
+    Buffer new_buffer = WithDType(old_buffer, dtype);
+    DTypeMutator mutator(old_buffer, new_buffer, dtype, block_sref_reuse);
+    Stmt new_block = mutator.VisitStmt(allocate_site);
+    return Downcast<Block>(new_block);
+  }
+
+ private:
+  DTypeMutator(const Buffer& old_buffer, Buffer new_buffer, const DataType& dtype,
+               Map<Block, Block>* block_sref_reuse)
+      : ReplaceBufferMutator(old_buffer, std::move(new_buffer), block_sref_reuse),
+        src_dtype_(old_buffer->dtype),
+        tgt_dtype_(dtype) {}
+
+  MatchBufferRegion VisitMatchBufferRegion(const MatchBufferRegion& match_buffer) final {
+    auto it = buffer_var_map_.find(match_buffer->source->buffer->data.get());
+    if (it != buffer_var_map_.end()) {
+      Buffer new_target_buffer = WithDType(match_buffer->buffer, it->second->dtype);
+      buffer_var_map_[match_buffer->buffer->data.get()] = new_target_buffer;
+      return MatchBufferRegion(new_target_buffer,
+                               BufferRegion(it->second, match_buffer->source->region));
+    } else {
+      return match_buffer;
+    }
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode* op) final {
+    BufferStore node = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+    auto it = buffer_var_map_.find(node->buffer->data.get());
+    if (it != buffer_var_map_.end()) {
+      node.CopyOnWrite()->buffer = it->second;
+      node.CopyOnWrite()->value = Cast(tgt_dtype_, node->value);
+    }
+    return node;
+  }
+
+  PrimExpr VisitExpr_(const BufferLoadNode* op) final {
+    BufferLoad node = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
+    auto it = buffer_var_map_.find(node->buffer->data.get());
+    if (it != buffer_var_map_.end()) {
+      return Cast(src_dtype_, BufferLoad(it->second, node->indices));
+    }
+    return node;
+  }
+
+  DataType src_dtype_, tgt_dtype_;
+};
+
+void UnsafeSetDType(ScheduleState self, const StmtSRef& block_sref, int buffer_index,
+                    const String& dtype) {
+  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  Buffer buffer =
+      GetNthAccessBuffer(self, GetRef<Block>(block), buffer_index, BufferIndexType::kWrite);
+  DataType target_dtype(runtime::String2DLDataType(dtype));
+
+  // Step 1. If `dtype` equals the original data type, just return.
+  if (buffer->dtype == target_dtype) {
+    return;
+  }
+
+  // Step 2. Get the allocation site of the target buffer.
+  StmtSRef alloc_site_sref =
+      NonAllocatedBufferError::CheckAndGetBufferAllocationSite(self->mod, block_sref, buffer);
+  const BlockNode* alloc_site = TVM_SREF_TO_BLOCK(alloc_site_sref);
+
+  // Step 3. Recursively replace old buffer to a new buffer, where the new buffer has the given
+  // dtype, and insert data type conversions.
+  Map<Block, Block> block_reuse_map;
+  Block new_block =
+      DTypeMutator::Mutate(GetRef<Block>(alloc_site), buffer, target_dtype, &block_reuse_map);
+  self->Replace(alloc_site_sref, new_block, block_reuse_map);
 }
 
 /******** InstructionKind Registration ********/
@@ -301,7 +419,63 @@ struct StorageAlignTraits : public UnpackedInstTraits<StorageAlignTraits> {
   friend struct ::tvm::tir::UnpackedInstTraits;
 };
 
+struct SetScopeTraits : public UnpackedInstTraits<SetScopeTraits> {
+  static constexpr const char* kName = "SetScope";
+  static constexpr bool kIsPure = false;
+
+ private:
+  static constexpr size_t kNumInputs = 1;
+  static constexpr size_t kNumAttrs = 2;
+  static constexpr size_t kNumDecisions = 0;
+
+  static void UnpackedApplyToSchedule(Schedule sch, BlockRV block_rv, Integer buffer_index,
+                                      String storage_scope) {
+    return sch->SetScope(block_rv, buffer_index->value, storage_scope);
+  }
+
+  static String UnpackedAsPython(Array<String> outputs, String block_rv, Integer buffer_index,
+                                 String storage_scope) {
+    PythonAPICall py("set_scope");
+    py.Input("block", block_rv);
+    py.Input("buffer_index", buffer_index);
+    py.Input("storage_scope", storage_scope);
+    return py.Str();
+  }
+
+  template <typename>
+  friend struct ::tvm::tir::UnpackedInstTraits;
+};
+
+struct UnsafeSetDTypeTraits : public UnpackedInstTraits<UnsafeSetDTypeTraits> {
+  static constexpr const char* kName = "UnsafeSetDType";
+  static constexpr bool kIsPure = false;
+
+ private:
+  static constexpr size_t kNumInputs = 1;
+  static constexpr size_t kNumAttrs = 2;
+  static constexpr size_t kNumDecisions = 0;
+
+  static void UnpackedApplyToSchedule(Schedule sch, BlockRV block_rv, Integer buffer_index,
+                                      String dtype) {
+    return sch->UnsafeSetDType(block_rv, buffer_index->value, dtype);
+  }
+
+  static String UnpackedAsPython(Array<String> outputs, String block_rv, Integer buffer_index,
+                                 String dtype) {
+    PythonAPICall py("unsafe_set_dtype");
+    py.Input("block", block_rv);
+    py.Input("buffer_index", buffer_index);
+    py.Input("dtype", dtype);
+    return py.Str();
+  }
+
+  template <typename>
+  friend struct ::tvm::tir::UnpackedInstTraits;
+};
+
 TVM_REGISTER_INST_KIND_TRAITS(StorageAlignTraits);
+TVM_REGISTER_INST_KIND_TRAITS(SetScopeTraits);
+TVM_REGISTER_INST_KIND_TRAITS(UnsafeSetDTypeTraits);
 
 }  // namespace tir
 }  // namespace tvm

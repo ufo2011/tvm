@@ -16,7 +16,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-#include <random>
 #include <utility>
 
 #include "./utils.h"
@@ -24,52 +23,59 @@
 namespace tvm {
 namespace meta_schedule {
 
-/*!
- * \brief Constructor function of TuneContext class.
- * \param mod The mod to be optimized.
- * \param target The target to be optimized for.
- * \param space_generator The design space generator.
- * \param task_name The name of the tuning task.
- * \param rand_state The random state.
- * \param num_threads The number of threads to be used.
- * \param verbose The verbosity level.
- */
-TuneContext::TuneContext(Optional<IRModule> mod,                                    //
-                         Optional<Target> target,                                   //
-                         Optional<SpaceGenerator> space_generator,                  //
-                         Optional<SearchStrategy> search_strategy,                  //
-                         Optional<String> task_name,                                //
-                         support::LinearCongruentialEngine::TRandState rand_state,  //
-                         int num_threads) {
+TuneContext::TuneContext(Optional<IRModule> mod, Optional<Target> target,
+                         Optional<SpaceGenerator> space_generator,
+                         Optional<SearchStrategy> search_strategy, Optional<String> task_name,
+                         int num_threads, TRandState rand_state, PackedFunc logger) {
+  CHECK(rand_state == -1 || rand_state >= 0) << "ValueError: Invalid random state: " << rand_state;
   ObjectPtr<TuneContextNode> n = make_object<TuneContextNode>();
   n->mod = mod;
   n->target = target;
   n->space_generator = space_generator;
   n->search_strategy = search_strategy;
   n->task_name = task_name;
-  if (rand_state == -1) {
-    rand_state = std::random_device()();
-  }
-  support::LinearCongruentialEngine(&n->rand_state).Seed(rand_state);
   n->num_threads = num_threads;
-  n->is_stopped = false;
-  n->runner_futures = NullOpt;
-  n->measure_candidates = NullOpt;
+  n->rand_state = support::LinearCongruentialEngine::NormalizeSeed(rand_state);
+  n->logger = logger;
   data_ = std::move(n);
 }
 
-TVM_REGISTER_NODE_TYPE(TuneContextNode);
+TuneContext TuneContextNode::Clone() const {
+  ObjectPtr<TuneContextNode> n = make_object<TuneContextNode>(*this);
+  if (this->space_generator.defined()) {
+    n->space_generator = this->space_generator.value()->Clone();
+  }
+  if (this->search_strategy.defined()) {
+    n->search_strategy = this->search_strategy.value()->Clone();
+  }
+  n->rand_state = ForkSeed(&n->rand_state);
+  n->Initialize();
+  return TuneContext(n);
+}
 
+void TuneContextNode::Initialize() {
+  if (this->space_generator.defined()) {
+    this->space_generator.value()->InitializeWithTuneContext(GetRef<TuneContext>(this));
+  }
+  if (this->search_strategy.defined()) {
+    this->search_strategy.value()->InitializeWithTuneContext(GetRef<TuneContext>(this));
+  }
+}
+
+TVM_REGISTER_NODE_TYPE(TuneContextNode);
 TVM_REGISTER_GLOBAL("meta_schedule.TuneContext")
-    .set_body_typed([](Optional<IRModule> mod,                                    //
-                       Optional<Target> target,                                   //
-                       Optional<SpaceGenerator> space_generator,                  //
-                       Optional<SearchStrategy> search_strategy,                  //
-                       Optional<String> task_name,                                //
-                       support::LinearCongruentialEngine::TRandState rand_state,  //
-                       int num_threads) -> TuneContext {
-      return TuneContext(mod, target, space_generator, search_strategy, task_name, rand_state,
-                         num_threads);
+    .set_body_typed([](Optional<IRModule> mod, Optional<Target> target,
+                       Optional<SpaceGenerator> space_generator,
+                       Optional<SearchStrategy> search_strategy, Optional<String> task_name,
+                       int num_threads, TRandState rand_state, PackedFunc logger) -> TuneContext {
+      return TuneContext(mod, target, space_generator, search_strategy, task_name, num_threads,
+                         rand_state, logger);
     });
+TVM_REGISTER_GLOBAL("meta_schedule._SHash2Hex").set_body_typed(SHash2Hex);
+TVM_REGISTER_GLOBAL("meta_schedule.TuneContextInitialize")
+    .set_body_method<TuneContext>(&TuneContextNode::Initialize);
+TVM_REGISTER_GLOBAL("meta_schedule.TuneContextClone")
+    .set_body_method<TuneContext>(&TuneContextNode::Clone);
+
 }  // namespace meta_schedule
 }  // namespace tvm

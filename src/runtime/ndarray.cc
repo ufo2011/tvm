@@ -121,6 +121,13 @@ struct NDArray::Internal {
     }
     delete ptr;
   }
+  // Deleter for NDArray based on external DLTensor
+  // The memory is allocated from outside and it is assumed that
+  // responsibility for its freeing is also outside
+  static void SelfDeleter(Object* ptr_obj) {
+    auto* ptr = static_cast<NDArray::Container*>(ptr_obj);
+    delete ptr;
+  }
   // Local create function which allocates tensor metadata
   // but does not allocate space for the data.
   static NDArray Create(ShapeTuple shape, DLDataType dtype, Device dev) {
@@ -172,19 +179,53 @@ struct NDArray::Internal {
   }
 };
 
-NDArray NDArray::CreateView(ShapeTuple shape, DLDataType dtype) {
+NDArray NDArray::CreateView(ShapeTuple shape, DLDataType dtype, uint64_t relative_byte_offset) {
   ICHECK(data_ != nullptr);
-  ICHECK(get_mutable()->dl_tensor.strides == nullptr) << "Can only create view for compact tensor";
-  NDArray ret = Internal::Create(shape, dtype, get_mutable()->dl_tensor.device);
-  ret.get_mutable()->dl_tensor.byte_offset = this->get_mutable()->dl_tensor.byte_offset;
+
+  const DLTensor& orig = get_mutable()->dl_tensor;
+  CHECK(IsContiguous()) << [&orig]() {
+    std::stringstream ss;
+    ss << "Can only create view for compact tensor, but found strides ";
+
+    ss << "[";
+    for (int i = 0; i < orig.ndim; i++) {
+      if (i) ss << ", ";
+      ss << orig.strides[i];
+    }
+    ss << "]";
+
+    ss << ", for shape ";
+    ss << "[";
+    for (int i = 0; i < orig.ndim; i++) {
+      if (i) ss << ", ";
+      ss << orig.shape[i];
+    }
+    ss << "]";
+    return ss.str();
+  }();
+
+  const auto& curr_dl_tensor = get_mutable()->dl_tensor;
+
+  NDArray ret = Internal::Create(shape, dtype, curr_dl_tensor.device);
+
   size_t curr_size = GetDataSize(this->get_mutable()->dl_tensor);
   size_t view_size = GetDataSize(ret.get_mutable()->dl_tensor);
-  ICHECK_LE(view_size, curr_size)
-      << "Tries to create a view that has bigger memory than current one";
+  CHECK_LE(relative_byte_offset + view_size, curr_size)
+      << "ValueError: "
+      << "View with shape " << shape << " and datatype " << dtype << " would have a size of "
+      << view_size << " bytes.  "
+      << "This would occupy bytes " << relative_byte_offset << " <= i_byte < "
+      << (relative_byte_offset + view_size) << " within the backing array.  "
+      << "However, the NDArray being viewed only contains " << curr_size << " bytes (shape = "
+      << ShapeTuple(curr_dl_tensor.shape, curr_dl_tensor.shape + curr_dl_tensor.ndim)
+      << ", dtype= " << curr_dl_tensor.dtype << ").";
+
   // increase ref count
   get_mutable()->IncRef();
   ret.get_mutable()->manager_ctx = get_mutable();
   ret.get_mutable()->dl_tensor.data = get_mutable()->dl_tensor.data;
+  ret.get_mutable()->dl_tensor.byte_offset =
+      get_mutable()->dl_tensor.byte_offset + relative_byte_offset;
   return ret;
 }
 
@@ -198,12 +239,43 @@ NDArray NDArray::Empty(ShapeTuple shape, DLDataType dtype, Device dev, Optional<
   return ret;
 }
 
+NDArray NDArray::FromExternalDLTensor(const DLTensor& dl_tensor) {
+  ICHECK(::tvm::runtime::IsContiguous(dl_tensor)) << "External DLTensor must be contiguous.";
+  ICHECK(IsAligned(dl_tensor)) << "Data in DLTensor is not aligned as required by NDArray";
+  NDArray::Container* data = new NDArray::Container();
+
+  data->SetDeleter(Internal::SelfDeleter);
+  data->dl_tensor = dl_tensor;
+  std::vector<ShapeTuple::index_type> shape;
+  shape.resize(data->dl_tensor.ndim);
+  shape.assign(data->dl_tensor.shape, data->dl_tensor.shape + data->dl_tensor.ndim);
+  data->shape_ = ShapeTuple(shape);
+  data->dl_tensor.shape = const_cast<ShapeTuple::index_type*>(data->shape_.data());
+
+  return NDArray(GetObjectPtr<Object>(data));
+}
+
+NDArray NDArray::NewFromDLTensor(DLTensor* tensor, const Device& dev) {
+  ICHECK(::tvm::runtime::IsContiguous(*tensor))
+      << "DLTensor is not contiguous. Copying from non-contiguous data is currently not supported";
+  std::vector<int64_t> shape;
+  for (int64_t i = 0; i < tensor->ndim; i++) {
+    shape.push_back(tensor->shape[i]);
+  }
+  NDArray ary = NDArray::Empty(shape, tensor->dtype, dev);
+  ary.CopyFrom(tensor);
+  return ary;
+}
+
 NDArray NDArray::FromDLPack(DLManagedTensor* tensor) {
   NDArray::Container* data = new NDArray::Container();
   // construct header
   data->SetDeleter(Internal::DLPackDeleter);
   // fill up content.
   data->manager_ctx = tensor;
+  ICHECK(::tvm::runtime::IsContiguous(tensor->dl_tensor)) << "DLManagedTensor must be contiguous.";
+  ICHECK(IsAligned(tensor->dl_tensor))
+      << "Data in DLManagedTensor is not aligned as required by NDArray";
   data->dl_tensor = tensor->dl_tensor;
   // update shape_
   std::vector<ShapeTuple::index_type> shape;
@@ -226,14 +298,26 @@ void NDArray::CopyFromBytes(const void* data, size_t nbytes) {
   ArrayCopyFromBytes(&get_mutable()->dl_tensor, data, nbytes);
 }
 
+NDArray NDArray::CopyTo(const Device& dev, Optional<String> mem_scope) const {
+  ICHECK(data_ != nullptr);
+  const DLTensor* dptr = operator->();
+  NDArray ret =
+      Empty(ShapeTuple(dptr->shape, dptr->shape + dptr->ndim), dptr->dtype, dev, mem_scope);
+  this->CopyTo(ret);
+  Device copy_gpu_dev = dptr->device.device_type != kDLCPU ? dptr->device : dev;
+  DeviceAPI::Get(copy_gpu_dev)->StreamSync(copy_gpu_dev, nullptr);
+  return ret;
+}
+
 void NDArray::CopyFromTo(const DLTensor* from, DLTensor* to, TVMStreamHandle stream) {
   size_t from_size = GetDataSize(*from);
   size_t to_size = GetDataSize(*to);
-  ICHECK_EQ(from_size, to_size) << "TVMArrayCopyFromTo: The size must exactly match";
+  ICHECK_EQ(from_size, to_size) << "TVMArrayCopyFromTo: The size in bytes must exactly match.";
 
   ICHECK(from->device.device_type == to->device.device_type || from->device.device_type == kDLCPU ||
          to->device.device_type == kDLCPU || from->device.device_type == kDLCUDAHost ||
-         to->device.device_type == kDLCUDAHost)
+         to->device.device_type == kDLCUDAHost || from->device.device_type == kDLROCMHost ||
+         to->device.device_type == kDLROCMHost)
       << "Can not copy across different device types directly. From device type: "
       << from->device.device_type << " to device type: " << to->device.device_type;
 
@@ -244,9 +328,25 @@ void NDArray::CopyFromTo(const DLTensor* from, DLTensor* to, TVMStreamHandle str
   DeviceAPI::Get(dev)->CopyDataFromTo(const_cast<DLTensor*>(from), to, stream);
 }
 
-ShapeTuple NDArray::Shape() const { return get_mutable()->shape_; }
+ShapeTuple NDArray::Shape() const {
+  return static_cast<const NDArray::Container*>(data_.get())->shape_;
+}
+
 runtime::DataType NDArray::DataType() const {
   return runtime::DataType(get_mutable()->dl_tensor.dtype);
+}
+
+bool NDArray::AbilityOfZeroCopyForDLTensor(DLTensor* tensor, const Device& dev) {
+  bool device_check = (dev.device_type == tensor->device.device_type);
+  bool device_id_check = (dev.device_id == tensor->device.device_id);
+  bool alignment_check = IsAligned(*tensor);
+  return device_check && device_id_check && alignment_check;
+}
+
+bool NDArray::IsAligned(const DLTensor& tensor) {
+  return (reinterpret_cast<size_t>(static_cast<char*>(tensor.data) + tensor.byte_offset) %
+              tvm::runtime::kAllocAlignment ==
+          0);
 }
 
 TVM_REGISTER_OBJECT_TYPE(NDArray::Container);
@@ -282,16 +382,9 @@ int TVMArrayAlloc(const tvm_index_t* shape, int ndim, int dtype_code, int dtype_
   API_END();
 }
 
-TVM_REGISTER_GLOBAL("runtime.TVMArrayAllocWithScope").set_body([](TVMArgs args, TVMRetValue* ret) {
-  int64_t* shape_ptr = static_cast<int64_t*>(static_cast<void*>(args[0]));
-  int ndim = args[1];
-  ShapeTuple shape(shape_ptr, shape_ptr + ndim);
-  DataType dtype = args[2];
-  tvm::Device dev = args[3];
-  Optional<String> mem_scope = args[4];
-  auto ndarray = NDArray::Empty(shape, dtype, dev, mem_scope);
-  *ret = ndarray;
-});
+TVM_REGISTER_GLOBAL("runtime.TVMArrayAllocWithScope").set_body_typed(NDArray::Empty);
+
+TVM_REGISTER_GLOBAL("runtime.TVMArrayCreateView").set_body_method(&NDArray::CreateView);
 
 int TVMArrayFree(TVMArrayHandle handle) {
   API_BEGIN();

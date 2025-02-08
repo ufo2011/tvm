@@ -16,6 +16,7 @@
 # under the License.
 """Unit tests for tensor helpers."""
 import tvm
+import tvm.testing
 from tvm import relay
 import pytest
 
@@ -26,14 +27,14 @@ def test_device_copy_via_string():
     assert isinstance(call, relay.Call)
     assert len(call.args) == 1
     assert call.args[0] == x
-    assert call.attrs.src_se_scope.device_type_int == 2  # ie kDLCUDA
-    assert call.attrs.src_se_scope.virtual_device_id == 0
-    assert call.attrs.src_se_scope.target is None
-    assert call.attrs.src_se_scope.memory_scope == ""
-    assert call.attrs.dst_se_scope.device_type_int == 1  # ie kDLCPU
-    assert call.attrs.dst_se_scope.virtual_device_id == 0
-    assert call.attrs.dst_se_scope.target is None
-    assert call.attrs.dst_se_scope.memory_scope == ""
+    assert call.attrs.src_virtual_device.device_type_int == 2  # ie kDLCUDA
+    assert call.attrs.src_virtual_device.virtual_device_id == 0
+    assert call.attrs.src_virtual_device.target is None
+    assert call.attrs.src_virtual_device.memory_scope == ""
+    assert call.attrs.dst_virtual_device.device_type_int == 1  # ie kDLCPU
+    assert call.attrs.dst_virtual_device.virtual_device_id == 0
+    assert call.attrs.dst_virtual_device.target is None
+    assert call.attrs.dst_virtual_device.memory_scope == ""
 
 
 def test_device_copy_via_device():
@@ -42,11 +43,9 @@ def test_device_copy_via_device():
     assert isinstance(call, relay.Call)
     assert len(call.args) == 1
     assert call.args[0] == x
-    assert call.attrs.src_se_scope.device_type_int == 2  # ie kDLCUDA
-    assert call.attrs.dst_se_scope.device_type_int == 1  # ie kDLCPU
+    assert call.attrs.src_virtual_device.device_type_int == 2  # ie kDLCUDA
+    assert call.attrs.dst_virtual_device.device_type_int == 1  # ie kDLCPU
 
 
 if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__] + sys.argv[1:]))
+    tvm.testing.main()

@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 """Test alter op layout pass"""
+import platform
 import pytest
 
 import tvm
@@ -22,8 +23,10 @@ from tvm import relay, topi
 from tvm.relay import transform, analysis
 from tvm.relay.testing.temp_op_attr import TempOpAttr
 from tvm.relay.testing import run_infer_type
+from tvm.target.codegen import llvm_version_major
 import numpy as np
 import tvm.testing
+from tvm.relay import testing
 
 
 def run_opt_pass(expr, passes):
@@ -71,7 +74,7 @@ def test_alter_op():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_return_none():
@@ -94,7 +97,7 @@ def test_alter_return_none():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(before(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
     assert called[0]
 
 
@@ -159,7 +162,53 @@ def test_alter_layout():
         a = run_opt_pass(a, [transform.CanonicalizeOps(), transform.AlterOpLayout()])
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
+
+
+def test_alter_layout_multi():
+    """Test alternating the layout of a conv2d.
+    The layout of broadcast operators and the weight should be changed accordingly.
+    """
+
+    def before():
+        x = relay.var("x", shape=(1, 64, 56, 56))
+        weight = relay.var("weight")
+        y = relay.nn.conv2d(x, weight, channels=128, kernel_size=(3, 3), padding=(1, 1))
+        y = relay.Function(analysis.free_vars(y), y)
+        return y
+
+    def alter_conv2d(attrs, inputs, tinfos, out_type):
+        data, weight = inputs
+        new_attrs = dict(attrs)
+        new_attrs["data_layout"] = "NCHW16c"
+        new_attrs["kernel_layout"] = "OHWI16i64o2i"
+        return relay.nn.conv2d(data, weight, **new_attrs)
+
+    def expected():
+        x = relay.var("x", shape=(1, 64, 56, 56))
+        weight = relay.var("weight", shape=(128, 64, 3, 3))
+
+        y = relay.layout_transform(x, "NCHW", "NCHW16c")
+        w = relay.layout_transform(weight, "OIHW", "OHWI16i64o2i")
+        y = relay.nn.conv2d(
+            y,
+            w,
+            channels=128,
+            kernel_size=(3, 3),
+            padding=(1, 1),
+            kernel_layout="OHWI16i64o2i",
+            data_layout="NCHW16c",
+        )
+        y = relay.layout_transform(y, "NCHW16c", "NCHW")
+        y = relay.Function(analysis.free_vars(y), y)
+        return y
+
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        a = before()
+        a = run_opt_pass(a, [transform.CanonicalizeOps(), transform.AlterOpLayout()])
+        b = run_opt_pass(expected(), transform.InferType())
+
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_lrn():
@@ -211,7 +260,7 @@ def test_alter_layout_lrn():
         a = run_opt_pass(a, [transform.CanonicalizeOps(), transform.AlterOpLayout()])
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_dual_path():
@@ -264,7 +313,7 @@ def test_alter_layout_dual_path():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_resnet():
@@ -312,7 +361,7 @@ def test_alter_layout_resnet():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_broadcast_op():
@@ -360,7 +409,7 @@ def test_alter_layout_broadcast_op():
         a = run_opt_pass(a, [transform.CanonicalizeOps(), transform.AlterOpLayout()])
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_broadcast_scalar_op():
@@ -419,7 +468,7 @@ def test_alter_layout_broadcast_scalar_op():
         a = run_opt_pass(a, [transform.CanonicalizeOps(), transform.AlterOpLayout()])
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_scalar():
@@ -460,7 +509,7 @@ def test_alter_layout_scalar():
         a = run_opt_pass(a, [transform.CanonicalizeOps(), transform.AlterOpLayout()])
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_scalar_regression():
@@ -550,7 +599,7 @@ def test_alter_layout_scalar_regression():
         )
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_concatenate():
@@ -594,7 +643,7 @@ def test_alter_layout_concatenate():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected_nchw(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
     # NHWC layout transformation.
     def before_nhwc():
@@ -632,7 +681,7 @@ def test_alter_layout_concatenate():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected_nhwc(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_nchw_upsamping_op():
@@ -671,7 +720,7 @@ def test_alter_layout_nchw_upsamping_op():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_nchw_dyn_upsamping_op():
@@ -710,7 +759,7 @@ def test_alter_layout_nchw_dyn_upsamping_op():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 @tvm.testing.parametrize_targets("llvm")
@@ -823,7 +872,7 @@ def test_alter_layout_strided_slice_axes_nhwc():
     mod_new = tvm.IRModule()
     mod_before["main"] = a
     mod_new["main"] = b
-    assert tvm.ir.structural_equal(mod_before, mod_new)
+    tvm.ir.assert_structural_equal(mod_before, mod_new)
 
 
 def test_alter_layout_depthwise_conv2d():
@@ -839,7 +888,7 @@ def test_alter_layout_depthwise_conv2d():
     from tvm import topi
 
     def alter_conv2d(attrs, inputs, tinfos, out_type):
-        with tvm.target.Target("llvm -mcpu=core-avx2"):
+        with tvm.target.Target("llvm -mtriple=x86_64-linux-gnu -mcpu=core-avx2"):
             return topi.nn.conv2d_alter_layout(attrs, inputs, tinfos, out_type)
 
     def expected():
@@ -867,7 +916,7 @@ def test_alter_layout_depthwise_conv2d():
         a = run_opt_pass(a, [transform.CanonicalizeOps(), transform.AlterOpLayout()])
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_prelu():
@@ -907,7 +956,7 @@ def test_alter_layout_prelu():
         a = run_opt_pass(a, [transform.CanonicalizeOps(), transform.AlterOpLayout()])
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_pad():
@@ -945,7 +994,7 @@ def test_alter_layout_pad():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected_nchw(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
     # Check NHWC conversion.
     def before_nhwc():
@@ -975,7 +1024,7 @@ def test_alter_layout_pad():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected_nhwc(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
     # Check that conversion does not happen when padding along split axis.
     def before():
@@ -1003,7 +1052,7 @@ def test_alter_layout_pad():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_pool():
@@ -1041,7 +1090,7 @@ def test_alter_layout_pool():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected_nchw(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
     # Check NHWC conversion.
     def before_nhwc():
@@ -1071,7 +1120,7 @@ def test_alter_layout_pool():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected_nhwc(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_sum():
@@ -1109,7 +1158,7 @@ def test_alter_layout_sum():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected_nchw(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
     # Check NHWC conversion.
     def before_nhwc():
@@ -1139,7 +1188,7 @@ def test_alter_layout_sum():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected_nhwc(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_nhwc_arm():
@@ -1148,7 +1197,7 @@ def test_alter_layout_nhwc_arm():
     def alter_conv2d(attrs, inputs, tinfos, out_type):
         from tvm import topi
 
-        with tvm.target.Target("llvm -device=arm_cpu"):
+        with tvm.target.Target("llvm -mtriple=arm-linux-gnu -device=arm_cpu"):
             return topi.nn.conv2d_alter_layout(attrs, inputs, tinfos, out_type)
 
     # Check NHWC conversion.
@@ -1176,14 +1225,14 @@ def test_alter_layout_nhwc_arm():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected_nhwc(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_layout_nhwc_int8_aarch64():
     """Check that AlterOplayout does not alter NHWC data layout."""
     from tvm import autotvm
 
-    expected_workload_shape = (20, 42, 4, 16)
+    expected_workload_shape = (20, 44, 4, 16)
 
     # We use Int8Fallback  to disable the fallback flag
     # and to test the new workload produced during the pass
@@ -1253,7 +1302,7 @@ def test_alter_layout_nhwc_int8_aarch64():
         a = run_opt_pass(a, transform.AlterOpLayout())
         b = run_opt_pass(expected_nhwc_int8(), transform.InferType())
 
-    assert tvm.ir.structural_equal(a, b), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b)
 
 
 def test_alter_op_with_global_var():
@@ -1300,7 +1349,7 @@ def test_alter_op_with_global_var():
         a = transform.AlterOpLayout()(a)
         b = transform.InferType()(expected())
 
-    assert tvm.ir.structural_equal(a, b, map_free_vars=True), "Actual = \n" + str(a)
+    tvm.ir.assert_structural_equal(a, b, map_free_vars=True)
 
 
 def test_alter_op_dense():
@@ -1326,7 +1375,7 @@ def test_alter_op_dense():
         y = relay.Function(analysis.free_vars(y), y)
         return y
 
-    target = "llvm -mcpu=core-avx2"
+    target = "llvm -mtriple=x86_64-linux-gnu -mcpu=core-avx2"
     with tvm.target.Target(target):
         with TempOpAttr(
             "nn.dense", "FTVMAlterOpLayout", topi.x86.dense_alter_op._alter_dense_layout
@@ -1334,7 +1383,7 @@ def test_alter_op_dense():
             a = before()
             a = run_opt_pass(a, transform.AlterOpLayout())
             b = run_opt_pass(expected(), transform.InferType())
-            assert tvm.ir.structural_equal(a, b)
+            tvm.ir.assert_structural_equal(a, b)
 
 
 def test_not_inplace_modify():
@@ -1394,13 +1443,121 @@ def test_alter_op_dense_packed_data():
         )
         return relay.Function(analysis.free_vars(dense), dense)
 
-    with tvm.target.Target("llvm -mcpu=core-avx2"):
+    with tvm.target.Target("llvm -mtriple=x86_64-linux-gnu -mcpu=core-avx2"):
         with TempOpAttr(
             "nn.dense", "FTVMAlterOpLayout", topi.x86.dense_alter_op._alter_dense_layout
         ):
             a = run_opt_pass(before(), transform.AlterOpLayout())
             b = run_opt_pass(expected(), transform.InferType())
+            tvm.ir.assert_structural_equal(a, b)
+
+
+@pytest.mark.skipif(
+    llvm_version_major() < 17, reason="SME is not supported in earlier versions of LLVM"
+)
+def test_alter_op_dense_arm_cpu_sme_float32():
+    np.random.seed(0)
+    y_data = np.random.uniform(size=(64, 32)).astype("float32")
+
+    def before():
+        x = relay.var("x", shape=(32, 32), dtype="float32")
+        y = relay.const(y_data, dtype="float32")
+        dense = relay.nn.dense(x, y)
+        return relay.Function(analysis.free_vars(dense), dense)
+
+    def expected():
+        x = relay.var("x", shape=(32, 32), dtype="float32")
+        y = relay.transpose(relay.const(y_data, dtype="float32"))
+        matmul = relay.nn.matmul(x, y)
+        return relay.Function(analysis.free_vars(matmul), matmul)
+
+    with tvm.target.Target("llvm -mtriple=aarch64-linux-gnu -mattr=+v9.2a,+sme"):
+        with TempOpAttr("nn.dense", "FTVMAlterOpLayout", topi.arm_cpu.dense_alter_op._alter_dense):
+            a = run_opt_pass(before(), transform.AlterOpLayout())
+            b = run_opt_pass(expected(), transform.InferType())
+            tvm.ir.assert_structural_equal(a, b)
+
+
+def test_alter_op_dense_arm_cpu_neon():
+    np.random.seed(0)
+    y_data = np.random.uniform(size=(64, 32)).astype("float32")
+
+    def before():
+        x = relay.var("x", shape=(32, 32), dtype="float32")
+        y = relay.const(y_data, dtype="float32")
+        dense = relay.nn.dense(x, y)
+        return relay.Function(analysis.free_vars(dense), dense)
+
+    def expected():
+        x = relay.var("x", shape=(32, 32), dtype="float32")
+        y = relay.transpose(relay.const(y_data, dtype="float32"))
+        matmul = relay.nn.matmul(x, y)
+        return relay.Function(analysis.free_vars(matmul), matmul)
+
+    with tvm.target.Target("llvm -mtriple=aarch64-linux-gnu -mattr=+v8.6a,+neon"):
+        with TempOpAttr("nn.dense", "FTVMAlterOpLayout", topi.arm_cpu.dense_alter_op._alter_dense):
+            a = run_opt_pass(before(), transform.AlterOpLayout())
+            b = run_opt_pass(expected(), transform.InferType())
             assert tvm.ir.structural_equal(a, b)
+
+
+@pytest.mark.skipif(
+    llvm_version_major() < 17, reason="SME is not supported in earlier versions of LLVM"
+)
+def test_alter_op_dense_arm_cpu_sme_float16_float32():
+    from tvm.relay.op.nn import _make  # pylint: disable-top-level-import
+
+    np.random.seed(0)
+    y_data = np.random.uniform(size=(64, 32)).astype("float16")
+
+    def before():
+        x = relay.var("x", shape=(32, 32), dtype="float16")
+        y = relay.const(y_data, dtype="float16")
+        dense = relay.nn.dense(x, y, out_dtype="float32")
+        return relay.Function(analysis.free_vars(dense), dense)
+
+    def expected():
+        x = relay.var("x", shape=(32, 32), dtype="float16")
+        y = relay.const(y_data, dtype="float16")
+        # Cannot make using the public API (relay.nn.matmul) since it will
+        # create an nn.dense op instead
+        matmul = _make.matmul(x, y, None, "float32", False, True)
+        return relay.Function(analysis.free_vars(matmul), matmul)
+
+    with tvm.target.Target("llvm -mtriple=aarch64-linux-gnu -mattr=+v9.2a,+sme"):
+        with TempOpAttr("nn.dense", "FTVMAlterOpLayout", topi.arm_cpu.dense_alter_op._alter_dense):
+            a = run_opt_pass(before(), transform.AlterOpLayout())
+            b = run_opt_pass(expected(), transform.InferType())
+            tvm.ir.assert_structural_equal(a, b)
+
+
+@pytest.mark.skipif(
+    llvm_version_major() < 17, reason="SME is not supported in earlier versions of LLVM"
+)
+@pytest.mark.parametrize("transpose_b", [False, True])
+def test_alter_op_matmul_arm_cpu_sme(transpose_b):
+    np.random.seed(0)
+    y_data = np.random.uniform(size=(64, 32)).astype("float32")
+
+    def before():
+        x = relay.var("x", shape=(96, 32), dtype="float32")
+        y = relay.const(y_data, dtype="float32")
+        dense = relay.nn.matmul(x, y, transpose_a=False, transpose_b=transpose_b)
+        return relay.Function(analysis.free_vars(dense), dense)
+
+    def expected():
+        x = relay.var("x", shape=(96, 32), dtype="float32")
+        y = relay.const(y_data, dtype="float32")
+        if transpose_b:
+            y = relay.transpose(y)
+        matmul = relay.nn.matmul(x, y)
+        return relay.Function(analysis.free_vars(matmul), matmul)
+
+    with tvm.target.Target("llvm -mtriple=aarch64-linux-gnu -mattr=+v9.2a,+sme"):
+        with TempOpAttr("nn.dense", "FTVMAlterOpLayout", topi.arm_cpu.dense_alter_op._alter_dense):
+            a = run_opt_pass(before(), transform.AlterOpLayout())
+            b = run_opt_pass(expected(), transform.InferType())
+            tvm.ir.assert_structural_equal(a, b)
 
 
 def test_conv2d_strided_slice_packed_to_unpacked():
@@ -1449,8 +1606,480 @@ def test_conv2d_strided_slice_packed_to_unpacked():
     with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
         a = run_opt_pass(before(), transform.AlterOpLayout())
         b = run_opt_pass(expected(), transform.InferType())
-        assert tvm.ir.structural_equal(a, b)
+        tvm.ir.assert_structural_equal(a, b)
+
+
+def test_conv2d_strided_slice_arbitrary_stride():
+    """Test rewriting strided_slice with arbitrary stride"""
+
+    def before():
+        x = relay.var("x", shape=(4, 12, 1, 1))
+        weight = relay.var("weight", shape=(9, 12, 1, 1))
+        y = relay.nn.conv2d(x, weight, channels=9, kernel_size=(1, 1), padding=(0, 0))
+        y = relay.strided_slice(y, begin=[3], end=[6], strides=[3], axes=[1])
+        y = relay.Function(analysis.free_vars(y), y)
+        return y
+
+    def alter_conv2d(attrs, inputs, tinfos, out_type):
+        data, weight = inputs
+        new_attrs = dict(attrs)
+        new_attrs["data_layout"] = "NCHW3c"
+        return relay.nn.conv2d(data, weight, **new_attrs)
+
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        run_opt_pass(before(), transform.AlterOpLayout())
+
+
+def test_conv2d_reduce_channels():
+    x = relay.var("data", shape=(1, 8, 48, 48))
+    y = relay.nn.conv2d(
+        data=x,
+        weight=relay.var("weight"),
+        kernel_size=(1, 1),
+        channels=8,
+        dilation=1,
+        strides=(47, 47),
+    )
+    z = relay.argmin(y, axis=1)
+
+    mod, params = testing.create_workload(z)
+
+    with tvm.transform.PassContext(opt_level=3):
+        relay.build(mod, params=params, target="llvm")
+
+
+@pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="Layout NCHW4c unsupported in `arm_cpu`. See https://github.com/apache/tvm/issues/16537",
+)
+def test_alter_layout_nonscalar_broadcast():
+    """Test boradcast operators"""
+
+    def before():
+        x = relay.var("x", shape=(1, 16, 3, 3))
+        weight = relay.var("weight", shape=(16, 16, 1, 1))
+        y = relay.nn.conv2d(
+            x, weight, channels=16, kernel_size=(1, 1), padding=(0, 0), data_layout="NCHW"
+        )
+        z = relay.var("z", shape=(1, 3, 3))
+        y = y + z
+        y = relay.Function(analysis.free_vars(y), y)
+        return y
+
+    def expected():
+        x = relay.var("x", shape=(1, 16, 3, 3))
+        weight = relay.var("weight", shape=(16, 16, 1, 1))
+        x = relay.layout_transform(x, src_layout="NCHW", dst_layout="NCHW4c")
+        weight = relay.layout_transform(weight, src_layout="OIHW", dst_layout="OIHW4i4o")
+        y = relay.nn.conv2d(
+            x,
+            weight,
+            channels=16,
+            kernel_size=(1, 1),
+            padding=(0, 0),
+            data_layout="NCHW4c",
+            kernel_layout="OIHW4i4o",
+        )
+        z = relay.var("z", shape=(1, 3, 3))
+        z = relay.expand_dims(z, 0)
+        z = relay.layout_transform(z, src_layout="NCHW", dst_layout="NCHW1c")
+        y = y + z
+        y = relay.layout_transform(y, src_layout="NCHW4c", dst_layout="NCHW")
+        y = relay.Function(analysis.free_vars(y), y)
+        return y
+
+    def alter_conv2d(attrs, inputs, tinfos, out_type):
+        data, weight = inputs
+        new_attrs = dict(attrs)
+        new_attrs["data_layout"] = "NCHW4c"
+        new_attrs["kernel_layout"] = "OIHW4i4o"
+        return relay.nn.conv2d(data, weight, **new_attrs)
+
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        a = run_opt_pass(before(), transform.AlterOpLayout())
+        b = run_opt_pass(expected(), transform.InferType())
+        tvm.ir.assert_structural_equal(a, b)
+
+    inp = np.random.uniform(size=(1, 16, 3, 3)).astype(np.float32)
+    weight = np.random.uniform(size=(16, 16, 1, 1)).astype(np.float32)
+    z = np.random.uniform(size=(1, 3, 3)).astype(np.float32)
+    mod = tvm.IRModule.from_expr(before())
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        with tvm.transform.PassContext(opt_level=4):
+            res = relay.build_module.create_executor(
+                "graph", mod, target="llvm", device=tvm.cpu()
+            ).evaluate()(inp, weight, z)
+    with tvm.transform.PassContext(opt_level=0):
+        res1 = relay.build_module.create_executor(
+            "debug", mod, target="llvm", device=tvm.cpu()
+        ).evaluate()(inp, weight, z)
+    np.testing.assert_allclose(res.numpy(), res1.numpy())
+
+
+@pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="Layout NCHW4c unsupported in `arm_cpu`. See https://github.com/apache/tvm/issues/16537",
+)
+def test_alter_layout_blocked_no_broadcast():
+    """Test boradcast operators working on already blocked layout"""
+
+    def before():
+        dtype = "float32"
+        input_shape = (1, 8, 16, 16, 4)
+        filter_shape = (1, 8, 4, 4, 4, 4)
+        bias_shape = (1, 1, 1, 1, 4)
+        A = relay.var("data", shape=input_shape, dtype=dtype)
+        B = relay.var("weight", shape=filter_shape, dtype=dtype)
+        C = relay.var("bias", shape=bias_shape, dtype=dtype)
+
+        conv = relay.nn.conv2d(
+            A,
+            B,
+            data_layout="NCHW4c",
+            kernel_layout="OIHW4i4o",
+            padding=[3, 3, 0, 0],
+            strides=[2, 2],
+            out_dtype=dtype,
+            channels=4,
+            kernel_size=(4, 4),
+        )
+        bias = relay.op.add(conv, C)
+        bias = relay.Function(analysis.free_vars(bias), bias)
+        return bias
+
+    def expected():
+        return before()
+
+    def alter_conv2d(attrs, inputs, tinfos, out_type):
+        data, weight = inputs
+        new_attrs = dict(attrs)
+        new_attrs["data_layout"] = "NCHW4c"
+        new_attrs["kernel_layout"] = "OIHW4i4o"
+        return relay.nn.conv2d(data, weight, **new_attrs)
+
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        a = run_opt_pass(before(), transform.AlterOpLayout())
+        b = run_opt_pass(expected(), transform.InferType())
+        tvm.ir.assert_structural_equal(a, b)
+
+    inp = np.random.uniform(size=(1, 8, 16, 16, 4)).astype(np.float32)
+    weight = np.random.uniform(size=(1, 8, 4, 4, 4, 4)).astype(np.float32)
+    z = np.random.uniform(size=(1, 1, 1, 1, 4)).astype(np.float32)
+    mod = tvm.IRModule.from_expr(before())
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        with tvm.transform.PassContext(opt_level=4):
+            res = relay.build_module.create_executor(
+                "graph", mod, target="llvm", device=tvm.cpu()
+            ).evaluate()(inp, weight, z)
+    with tvm.transform.PassContext(opt_level=0):
+        res1 = relay.build_module.create_executor(
+            "debug", mod, target="llvm", device=tvm.cpu()
+        ).evaluate()(inp, weight, z)
+    np.testing.assert_allclose(res.numpy(), res1.numpy())
+
+
+@pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="Layout NCHW4c unsupported in `arm_cpu`. See https://github.com/apache/tvm/issues/16537",
+)
+def test_alter_layout_blocked_broadcast():
+    """Test boradcast operators working on already blocked layout"""
+
+    def before():
+        dtype = "float32"
+        input_shape = (1, 8, 16, 16, 4)
+        filter_shape = (1, 8, 4, 4, 4, 4)
+        bias_shape = (1, 1, 1, 1, 1)
+        A = relay.var("data", shape=input_shape, dtype=dtype)
+        B = relay.var("weight", shape=filter_shape, dtype=dtype)
+        C = relay.var("bias", shape=bias_shape, dtype=dtype)
+
+        conv = relay.nn.conv2d(
+            A,
+            B,
+            data_layout="NCHW4c",
+            kernel_layout="OIHW4i4o",
+            padding=[3, 3, 0, 0],
+            strides=[2, 2],
+            out_dtype=dtype,
+            channels=4,
+            kernel_size=(4, 4),
+        )
+        bias = relay.op.add(conv, C)
+        bias = relay.Function(analysis.free_vars(bias), bias)
+        return bias
+
+    def expected():
+        return before()
+
+    def alter_conv2d(attrs, inputs, tinfos, out_type):
+        data, weight = inputs
+        new_attrs = dict(attrs)
+        new_attrs["data_layout"] = "NCHW4c"
+        new_attrs["kernel_layout"] = "OIHW4i4o"
+        return relay.nn.conv2d(data, weight, **new_attrs)
+
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        a = run_opt_pass(before(), transform.AlterOpLayout())
+        b = run_opt_pass(expected(), transform.InferType())
+        tvm.ir.assert_structural_equal(a, b)
+
+    inp = np.random.uniform(size=(1, 8, 16, 16, 4)).astype(np.float32)
+    weight = np.random.uniform(size=(1, 8, 4, 4, 4, 4)).astype(np.float32)
+    z = np.random.uniform(size=(1, 1, 1, 1, 1)).astype(np.float32)
+    mod = tvm.IRModule.from_expr(before())
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        with tvm.transform.PassContext(opt_level=4):
+            res = relay.build_module.create_executor(
+                "graph", mod, target="llvm", device=tvm.cpu()
+            ).evaluate()(inp, weight, z)
+    with tvm.transform.PassContext(opt_level=0):
+        res1 = relay.build_module.create_executor(
+            "debug", mod, target="llvm", device=tvm.cpu()
+        ).evaluate()(inp, weight, z)
+    np.testing.assert_allclose(res.numpy(), res1.numpy())
+
+
+@pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="Layout NCHW4c unsupported in `arm_cpu`. See https://github.com/apache/tvm/issues/16537",
+)
+def test_alter_layout_re_blocking_broadcast():
+    """Test of re-blocking shapes with boradcast operators"""
+
+    def before():
+        dtype = "float32"
+        input_shape = (1, 8, 16, 16, 4)
+        filter_shape = (1, 8, 4, 4, 4, 4)
+        bias_shape = (1, 1, 1, 1, 4)
+        A = relay.var("data", shape=input_shape, dtype=dtype)
+        B = relay.var("weight", shape=filter_shape, dtype=dtype)
+        C = relay.var("bias", shape=bias_shape, dtype=dtype)
+
+        conv = relay.nn.conv2d(
+            A,
+            B,
+            data_layout="NCHW4c",
+            kernel_layout="OIHW4i4o",
+            padding=[3, 3, 0, 0],
+            strides=[2, 2],
+            out_dtype=dtype,
+            channels=4,
+            kernel_size=(4, 4),
+        )
+        bias = relay.op.add(conv, C)
+        bias = relay.Function(analysis.free_vars(bias), bias)
+        return bias
+
+    def expected():
+        dtype = "float32"
+        input_shape = (1, 8, 16, 16, 4)
+        filter_shape = (1, 8, 4, 4, 4, 4)
+        bias_shape = (1, 1, 1, 1, 4)
+        A = relay.var("data", shape=input_shape, dtype=dtype)
+        B = relay.var("weight", shape=filter_shape, dtype=dtype)
+        C = relay.var("bias", shape=bias_shape, dtype=dtype)
+
+        A = relay.layout_transform(A, src_layout="NCHW4c", dst_layout="NCHW2c")
+        B = relay.layout_transform(B, src_layout="OIHW4i4o", dst_layout="OIHW2i2o")
+
+        conv = relay.nn.conv2d(
+            A,
+            B,
+            data_layout="NCHW2c",
+            kernel_layout="OIHW2i2o",
+            padding=[3, 3, 0, 0],
+            strides=[2, 2],
+            out_dtype=dtype,
+            channels=4,
+            kernel_size=(4, 4),
+        )
+        C = relay.layout_transform(C, src_layout="NCHW4c", dst_layout="NCHW2c")
+        bias = relay.op.add(conv, C)
+        bias = relay.layout_transform(bias, src_layout="NCHW2c", dst_layout="NCHW4c")
+        bias = relay.Function(analysis.free_vars(bias), bias)
+        return bias
+
+    def alter_conv2d(attrs, inputs, tinfos, out_type):
+        data, weight = inputs
+        new_attrs = dict(attrs)
+        new_attrs["data_layout"] = "NCHW2c"
+        new_attrs["kernel_layout"] = "OIHW2i2o"
+        return relay.nn.conv2d(data, weight, **new_attrs)
+
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        a = run_opt_pass(before(), transform.AlterOpLayout())
+        b = run_opt_pass(expected(), transform.InferType())
+        tvm.ir.assert_structural_equal(a, b)
+
+    inp = np.random.uniform(size=(1, 8, 16, 16, 4)).astype(np.float32)
+    weight = np.random.uniform(size=(1, 8, 4, 4, 4, 4)).astype(np.float32)
+    z = np.random.uniform(size=(1, 1, 1, 1, 4)).astype(np.float32)
+    mod = tvm.IRModule.from_expr(before())
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        with tvm.transform.PassContext(opt_level=4):
+            res = relay.build_module.create_executor(
+                "graph", mod, target="llvm", device=tvm.cpu()
+            ).evaluate()(inp, weight, z)
+    with tvm.transform.PassContext(opt_level=0):
+        res1 = relay.build_module.create_executor(
+            "debug", mod, target="llvm", device=tvm.cpu()
+        ).evaluate()(inp, weight, z)
+    np.testing.assert_allclose(res.numpy(), res1.numpy(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="Layout NCHW4c unsupported in `arm_cpu`. See https://github.com/apache/tvm/issues/16537",
+)
+def test_broadcast_non_adaptable():
+    """NCHW4c + [x, x, 4] and NCHW4c is being altered to NCHW"""
+
+    def before():
+        x = relay.var("x", shape=(1, 4, 3, 3, 4))
+        weight = relay.var("weight", shape=(4, 4, 1, 1, 4, 4))
+        y = relay.nn.conv2d(
+            x,
+            weight,
+            channels=16,
+            kernel_size=(1, 1),
+            padding=(0, 0),
+            data_layout="NCHW4c",
+            kernel_layout="OIHW4i4o",
+        )
+        z = relay.var("z", shape=(3, 3, 4))
+        y = y + z
+        y = relay.Function(analysis.free_vars(y), y)
+        return y
+
+    def expected():
+        x = relay.var("x", shape=(1, 4, 3, 3, 4))
+        weight = relay.var("weight", shape=(4, 4, 1, 1, 4, 4))
+        x = relay.layout_transform(x, src_layout="NCHW4c", dst_layout="NCHW")
+        weight = relay.layout_transform(weight, src_layout="OIHW4i4o", dst_layout="OIHW")
+        y = relay.nn.conv2d(
+            x,
+            weight,
+            channels=16,
+            kernel_size=(1, 1),
+            padding=(0, 0),
+            data_layout="NCHW",
+            kernel_layout="OIHW",
+        )
+        z = relay.var("z", shape=(3, 3, 4))
+        y = relay.layout_transform(y, src_layout="NCHW", dst_layout="NCHW4c")
+        y = y + z
+        y = relay.Function(analysis.free_vars(y), y)
+        return y
+
+    def alter_conv2d(attrs, inputs, tinfos, out_type):
+        data, weight = inputs
+        new_attrs = dict(attrs)
+        new_attrs["data_layout"] = "NCHW"
+        new_attrs["kernel_layout"] = "OIHW"
+        return relay.nn.conv2d(data, weight, **new_attrs)
+
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        a = run_opt_pass(before(), transform.AlterOpLayout())
+        b = run_opt_pass(expected(), transform.InferType())
+        tvm.ir.assert_structural_equal(a, b)
+
+    inp = np.random.uniform(size=(1, 4, 3, 3, 4)).astype(np.float32)
+    weight = np.random.uniform(size=(4, 4, 1, 1, 4, 4)).astype(np.float32)
+    z = np.random.uniform(size=(3, 3, 4)).astype(np.float32)
+    mod = tvm.IRModule.from_expr(before())
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        with tvm.transform.PassContext(opt_level=4):
+            res = relay.build_module.create_executor(
+                "graph", mod, target="llvm", device=tvm.cpu()
+            ).evaluate()(inp, weight, z)
+    with tvm.transform.PassContext(opt_level=0):
+        res1 = relay.build_module.create_executor(
+            "debug", mod, target="llvm", device=tvm.cpu()
+        ).evaluate()(inp, weight, z)
+    np.testing.assert_allclose(res.numpy(), res1.numpy())
+
+
+@pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="Layout NCHW4c unsupported in `arm_cpu`. See https://github.com/apache/tvm/issues/16537",
+)
+def test_broadcast_respect_input_layouts():
+    def before():
+        x = relay.var("x", shape=(1, 16, 1, 1))
+        w = relay.var("w", shape=(16, 16, 1, 1))
+        x = relay.nn.conv2d(
+            x,
+            w,
+            kernel_size=(1, 1),
+            padding=(0, 0),
+            channels=16,
+        )
+        y1 = relay.min(x, axis=[2])
+        y2 = relay.min(x, axis=[3])
+        z = y1 + y2
+        z = relay.Function(analysis.free_vars(z), z)
+        return z
+
+    def alter_conv2d(attrs, inputs, tinfos, out_type):
+        data, weight = inputs
+        new_attrs = dict(attrs)
+        new_attrs["data_layout"] = "NCHW4c"
+        new_attrs["kernel_layout"] = "OIHW4i4o"
+        return relay.nn.conv2d(data, weight, **new_attrs)
+
+    inp = np.random.uniform(size=(1, 16, 1, 1)).astype(np.float32)
+    weight = np.random.uniform(size=(16, 16, 1, 1)).astype(np.float32)
+    mod = tvm.IRModule.from_expr(before())
+    with TempOpAttr("nn.conv2d", "FTVMAlterOpLayout", alter_conv2d):
+        with tvm.transform.PassContext(opt_level=4):
+            res = relay.build_module.create_executor(
+                "graph", mod, target="llvm", device=tvm.cpu()
+            ).evaluate()(inp, weight)
+    with tvm.transform.PassContext(opt_level=0):
+        res1 = relay.build_module.create_executor(
+            "debug", mod, target="llvm", device=tvm.cpu()
+        ).evaluate()(inp, weight)
+    np.testing.assert_allclose(res.numpy(), res1.numpy())
+
+
+def test_axis_semantic_change():
+    x = relay.var("x", shape=(1, 1, 24, 48))
+    w1 = relay.const(np.random.uniform(size=(1, 1, 1, 1)))
+    w2 = relay.const(np.random.uniform(size=(1, 1, 1, 1)))
+    y = relay.nn.conv2d(x, w1, kernel_size=(1, 1), padding=(0, 0), channels=1)
+    y = relay.transpose(y, (0, 1, 3, 2))
+    z = relay.nn.conv2d(y, w2, kernel_size=(1, 1), padding=(0, 0), channels=1)
+    func = relay.Function([x], z)
+    mod = tvm.IRModule.from_expr(func)
+    with tvm.transform.PassContext(opt_level=3):
+        relay.build(mod, target="llvm")
+
+
+def test_alter_with_subfunc():
+    v1 = relay.var("v", shape=[1, 256, 10, 10], dtype="float32")
+    v2 = relay.image.resize2d(v1, size=[16, 16], roi=[0.0, 0.0, 0.0, 0.0], rounding_method="")
+    sub_func = relay.Function([v1], v2)
+    x1 = relay.var("x", shape=[1, 256, 10, 10], dtype="float32")
+    x2 = sub_func(x1)
+    x3 = relay.image.resize2d(x2, size=[8, 8], roi=[0.0, 0.0, 0.0, 0.0], rounding_method="")
+    func = relay.Function([x1], x3)
+    mod = tvm.IRModule.from_expr(func)
+    mod = relay.transform.InferType()(mod)
+    tvm.ir.assert_structural_equal(relay.transform.AlterOpLayout()(mod), mod)
+
+
+def test_alter_with_reduce():
+    x = relay.var("x", shape=(1, 1, 1, 1))
+    y = relay.image.resize2d(x, (2, 4))
+    z = relay.mean(y, axis=0)
+    a = relay.image.resize1d(z, (1,))
+    func = relay.Function((x,), a)
+    mod = tvm.IRModule.from_expr(func)
+    mod = relay.transform.InferType()(mod)
+    with tvm.transform.PassContext(opt_level=4):
+        relay.build(mod, target="llvm")
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    tvm.testing.main()

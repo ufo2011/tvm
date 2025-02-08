@@ -26,7 +26,7 @@ def list_tags() -> Optional[Dict[str, Target]]:
     Returns
     -------
     tag_dict : Optional[Dict[str, Target]]
-        The dict of tags mapping each tag name to to its corresponding target.
+        The dict of tags mapping each tag name to its corresponding target.
         None if TVM is built in runtime-only mode.
     """
     if hasattr(_ffi_api, "TargetTagListTags"):
@@ -67,9 +67,6 @@ def register_tag(name: str, config: Dict[str, Any], override: bool = False) -> O
     return None
 
 
-# To check the correctness of all registered tags, the call is made in library loading time.
-list_tags()
-
 # We purposely maintain all tags in the C++ side to support pure C++ use cases,
 # and the Python API is only used for fast prototyping.
 register_tag(
@@ -79,3 +76,6 @@ register_tag(
         "arch": "sm_61",
     },
 )
+
+# To check the correctness of all registered tags, the call is made in library loading time.
+list_tags()

@@ -34,18 +34,13 @@ Trace::Trace(Array<Instruction> insts, Map<Instruction, ObjectRef> decisions) {
 
 /**************** Utilities  ****************/
 
-bool IsPostproc(const InstructionKind& inst_kind) {
-  static InstructionKind inst_enter_postproc = InstructionKind::Get("EnterPostproc");
-  return inst_kind.same_as(inst_enter_postproc);
-}
-
 int GetNumValidInstructions(const Array<Instruction>& insts, bool remove_postproc) {
   if (!remove_postproc) {
     return insts.size();
   }
   int n_insts = 0;
   for (const Instruction& inst : insts) {
-    if (!IsPostproc(inst->kind)) {
+    if (!inst->kind->IsPostproc()) {
       ++n_insts;
     } else {
       break;
@@ -60,6 +55,17 @@ Array<ObjectRef> TranslateInputRVs(const Array<ObjectRef>& inputs,
                                    const std::unordered_map<const Object*, const Object*>& rv_map) {
   Array<ObjectRef> result;
   result.reserve(inputs.size());
+  auto f_subst_with_rv_map = [&rv_map](const Var& var) -> Optional<PrimExpr> {
+    auto it = rv_map.find(var.get());
+    if (it == rv_map.end()) {
+      return NullOpt;
+    }
+    const Object* dst = it->second;
+    ICHECK(dst->IsInstance<VarNode>())
+        << "TypeError: Expect 'tir.Var', but gets: " << dst->GetTypeKey();
+    return GetRef<Var>(static_cast<const VarNode*>(dst));
+  };
+
   for (const ObjectRef& input : inputs) {
     if (!input.defined() ||                   // constant: nullptr
         input->IsInstance<StringObj>() ||     // constant: string
@@ -72,18 +78,13 @@ Array<ObjectRef> TranslateInputRVs(const Array<ObjectRef>& inputs,
       auto it = rv_map.find(input.get());
       ICHECK(it != rv_map.end()) << "IndexError: Random variable doesn't exist: " << input;
       result.push_back(GetRef<ObjectRef>(it->second));
-    } else if (const auto* expr = input.as<PrimExprNode>()) {  // RV: Expr
-      result.push_back(
-          Substitute(GetRef<PrimExpr>(expr), [&rv_map](const Var& var) -> Optional<PrimExpr> {
-            auto it = rv_map.find(var.get());
-            if (it == rv_map.end()) {
-              return NullOpt;
-            }
-            const Object* dst = it->second;
-            ICHECK(dst->IsInstance<VarNode>())
-                << "TypeError: Expect 'tir.Var', but gets: " << dst->GetTypeKey();
-            return GetRef<Var>(static_cast<const VarNode*>(dst));
-          }));
+    } else if (auto expr = input.as<PrimExpr>()) {  // RV: Expr
+      result.push_back(Substitute(expr.value(), f_subst_with_rv_map));
+    } else if (auto index_map = input.as<IndexMap>()) {
+      result.push_back(Substitute(index_map.value(), f_subst_with_rv_map));
+    } else if (auto arr = input.as<Array<ObjectRef>>()) {
+      // Recursively convert elements of the array into a new list of ObjectRefs.
+      result.push_back(TranslateInputRVs(arr.value(), rv_map));
     } else {
       ICHECK(false) << "TypeError: Cannot recognize the type of an input random variable: "
                     << input->GetTypeKey();
@@ -111,9 +112,27 @@ Array<ObjectRef> TranslateInputRVs(
     } else if (const auto* str_obj = input.as<StringObj>()) {
       // Case 2. string => "content"
       results.push_back(String('"' + std::string(str_obj->data) + '"'));
-    } else if (input->IsInstance<IntImmNode>() || input->IsInstance<FloatImmNode>()) {
+    } else if (input->IsInstance<IntImmNode>() || input->IsInstance<FloatImmNode>() ||
+               input->IsInstance<runtime::Int::ContainerType>() ||
+               input->IsInstance<runtime::Float::ContainerType>()) {
       // Case 3. integer or floating-point number
       results.push_back(input);
+    } else if (input->IsInstance<ArrayNode>()) {
+      // Case 4: array
+      results.push_back(TranslateInputRVs(Downcast<Array<ObjectRef>>(input), rv_names));
+    } else if (input->IsInstance<MapNode>()) {
+      // Case 5: dict
+      results.push_back(input);
+    } else if (input->IsInstance<IndexMapNode>()) {
+      // // Case 6: IndexMap
+      IndexMap index_map = Downcast<IndexMap>(input);
+      index_map = index_map.RenameVariables([&rv_names](const Var& var) -> Optional<String> {
+        if (auto it = rv_names.find(var); it != rv_names.end()) {
+          return it->second;
+        }
+        return NullOpt;
+      });
+      results.push_back(index_map);
     } else if (input->IsInstance<BlockRVNode>() || inputs->IsInstance<LoopRVNode>() ||
                inputs->IsInstance<VarNode>()) {
       LOG(FATAL) << "IndexError: Random variable is not defined " << input;
@@ -132,7 +151,19 @@ Array<ObjectRef> TranslateInputRVs(const Array<ObjectRef>& inputs,
   results.reserve(inputs.size());
   for (const ObjectRef& input : inputs) {
     // Case 3. integer or floating-point number
-    if (input->IsInstance<IntImmNode>() || input->IsInstance<FloatImmNode>()) {
+    if (input->IsInstance<IntImmNode>() || input->IsInstance<FloatImmNode>() ||
+        input->IsInstance<runtime::Int::ContainerType>() ||
+        input->IsInstance<runtime::Float::ContainerType>()) {
+      results.push_back(input);
+      continue;
+    }
+    // Case 4. array
+    if (input->IsInstance<ArrayNode>()) {
+      results.push_back(TranslateInputRVs(Downcast<Array<ObjectRef>>(input), named_rvs));
+      continue;
+    }
+    // Case 5. dict
+    if (input->IsInstance<MapNode>()) {
       results.push_back(input);
       continue;
     }
@@ -141,8 +172,27 @@ Array<ObjectRef> TranslateInputRVs(const Array<ObjectRef>& inputs,
     CHECK_GT(str->size, 0) << "ValueError: Empty string is not allowed in input names";
     const char* name = str->data;
     int64_t size = str->size;
+    if (name[0] == '{' && name[size - 1] == '}') {
+      ObjectRef obj = LoadJSON(name);
+      // Case 6. IndexMap
+      if (obj->IsInstance<IndexMapNode>()) {
+        IndexMap index_map = Downcast<IndexMap>(obj);
+        index_map = Substitute(index_map, [&named_rvs](const Var& var) -> Optional<PrimExpr> {
+          auto it = named_rvs.find(var->name_hint);
+          if (it != named_rvs.end()) {
+            return Downcast<Var>(it->second);
+          }
+          return NullOpt;
+        });
+        results.push_back(index_map);
+        continue;
+      } else {
+        LOG(FATAL) << "TypeError: Unexpected object: " << obj->GetTypeKey();
+        throw;
+      }
+    }
     // Case 2. string
-    if (size > 2 && name[0] == '"' && name[size - 1] == '"') {
+    if (size >= 2 && name[0] == '"' && name[size - 1] == '"') {
       results.push_back(String(std::string(name + 1, size - 2)));
       continue;
     }
@@ -177,7 +227,9 @@ Array<String> TranslateAddOutputRVs(
     ICHECK(!rv_names->count(output))
         << "ValueError: The random variable has been produced once: " << rv_names->at(output);
     String result{ObjectPtr<StringObj>{nullptr}};
-    if (output->IsInstance<BlockRVNode>()) {
+    if (!output.defined()) {
+      result = "_";
+    } else if (output->IsInstance<BlockRVNode>()) {
       result = "b" + std::to_string(i);
     } else if (output->IsInstance<LoopRVNode>()) {
       result = "l" + std::to_string(i);
@@ -242,7 +294,7 @@ void TraceNode::ApplyToSchedule(
         decision_provider) const {
   std::unordered_map<const Object*, const Object*> rv_map;
   for (const Instruction& inst : this->insts) {
-    if (remove_postproc && IsPostproc(inst->kind)) {
+    if (remove_postproc && inst->kind->IsPostproc()) {
       break;
     }
     Array<ObjectRef> inputs = TranslateInputRVs(inst->inputs, rv_map);
@@ -266,7 +318,7 @@ ObjectRef TraceNode::AsJSON(bool remove_postproc) const {
   int i = 0;
   for (const Instruction& inst : this->insts) {
     const InstructionKind& kind = inst->kind;
-    if (remove_postproc && IsPostproc(kind)) {
+    if (remove_postproc && kind->IsPostproc()) {
       break;
     }
     json_insts.push_back(Array<ObjectRef>{
@@ -295,7 +347,7 @@ Array<String> TraceNode::AsPython(bool remove_postproc) const {
   Array<String> py_trace;
   py_trace.reserve(this->insts.size());
   for (const Instruction& inst : this->insts) {
-    if (remove_postproc && IsPostproc(inst->kind)) {
+    if (remove_postproc && inst->kind->IsPostproc()) {
       break;
     }
     Array<ObjectRef> attrs;
@@ -342,9 +394,9 @@ void Trace::ApplyJSONToSchedule(ObjectRef json, Schedule sch) {
     try {
       const ArrayNode* arr = decision_entry.as<ArrayNode>();
       ICHECK(arr && arr->size() == 2);
-      const IntImmNode* arr0 = arr->at(0).as<IntImmNode>();
+      auto arr0 = arr->at(0).as<runtime::Int>();
       ICHECK(arr0);
-      index = arr0->value;
+      index = arr0.value();
       decision = arr->at(1);
     } catch (const tvm::Error& e) {
       LOG(FATAL) << "ValueError: Each entry of a json decision should be a tuple [index, "
@@ -440,8 +492,10 @@ Trace TraceNode::Simplified(bool remove_postproc) const {
     }
     // Add its inputs as "used" ones
     for (const ObjectRef& obj : inst->inputs) {
-      if (obj->IsInstance<BlockRVNode>() || obj->IsInstance<LoopRVNode>() ||
-          obj->IsInstance<VarNode>()) {
+      if (!obj.defined()) {
+        continue;
+      } else if (obj->IsInstance<BlockRVNode>() || obj->IsInstance<LoopRVNode>() ||
+                 obj->IsInstance<VarNode>()) {
         used_rvs.insert(obj.get());
         continue;
       } else if (obj->IsInstance<PrimExprNode>()) {
@@ -463,16 +517,22 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
     .set_dispatch<TraceNode>([](const ObjectRef& obj, ReprPrinter* p) {
       const auto* self = obj.as<TraceNode>();
       ICHECK_NOTNULL(self);
+      p->stream << "# from tvm import tir\n";
+      p->stream << "def apply_trace(sch: tir.Schedule) -> None:\n";
       Array<String> repr = self->AsPython(/*remove_postproc=*/false);
       bool is_first = true;
       for (const String& line : repr) {
         if (is_first) {
           is_first = false;
         } else {
-          p->stream << std::endl;
+          p->stream << '\n';
         }
-        p->stream << line;
+        p->stream << "  " << line;
       }
+      if (is_first) {
+        p->stream << "  pass";
+      }
+      p->stream << std::flush;
     });
 
 /**************** Instruction Registration ****************/

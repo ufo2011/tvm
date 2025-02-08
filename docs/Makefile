@@ -69,7 +69,7 @@ clean:
 	# propagated.
 
 	# Remove folders that have since been relocated into
-	# $(STAGINGDIR).  This allows `task_sphinx_precheck.sh` to
+	# $(STAGINGDIR).  This allows `task_python_docs.sh` to
 	# run, even if a commit that predates $(STAGINGDIR) was
 	# previously run on that node.
 	rm -rf gen_modules
@@ -110,6 +110,10 @@ html: staging
 	cd $(STAGINGDIR) && $(SPHINXBUILD) -b html $(ALLSPHINXOPTS) $(PWD)/$(BUILDDIR)/html
 	@echo
 	@echo "Build finished. The HTML pages are in $(BUILDDIR)/html."
+
+htmldepoly: html
+	python3 $(PWD)/download_3rdparty_embeds.py -v
+	@echo "Replaced external URLs with local files."
 
 dirhtml: staging
 	cd $(STAGINGDIR) && $(SPHINXBUILD) -b dirhtml $(ALLSPHINXOPTS) $(PWD)/$(BUILDDIR)/dirhtml

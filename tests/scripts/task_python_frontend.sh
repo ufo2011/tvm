@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,8 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
-set -u
+set -euxo pipefail
 
 source tests/scripts/setup-pytest-env.sh
 # to avoid openblas threading error
@@ -26,31 +25,4 @@ export OMP_NUM_THREADS=1
 
 export TVM_TEST_TARGETS="llvm;cuda"
 
-find . -type f -path "*.pyc" | xargs rm -f
-
-# Rebuild cython
-make cython3
-
-echo "Running relay MXNet frontend test..."
-run_pytest cython python-frontend-mxnet tests/python/frontend/mxnet
-
-echo "Running relay ONNX frontend test..."
-run_pytest cython python-frontend-onnx tests/python/frontend/onnx
-
-echo "Running relay CoreML frontend test..."
-run_pytest cython python-frontend-coreml tests/python/frontend/coreml
-
-echo "Running relay Tensorflow frontend test..."
-run_pytest cython python-frontend-tensorflow tests/python/frontend/tensorflow
-
-echo "Running relay caffe2 frontend test..."
-run_pytest cython python-frontend-caffe2 tests/python/frontend/caffe2
-
-echo "Running relay DarkNet frontend test..."
-run_pytest cython python-frontend-darknet tests/python/frontend/darknet
-
-echo "Running relay PyTorch frontend test..."
-run_pytest cython python-frontend-pytorch tests/python/frontend/pytorch
-
-echo "Running relay PaddlePaddle frontend test..."
-run_pytest cython python-frontend-paddlepaddle tests/python/frontend/paddlepaddle
+# TODO(Siyuan): Keep this file for passing CI

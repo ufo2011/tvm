@@ -24,8 +24,10 @@
 #ifndef TVM_TOPI_TRANSFORM_H_
 #define TVM_TOPI_TRANSFORM_H_
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/te/operation.h>
 #include <tvm/tir/data_layout.h>
+#include <tvm/tir/index_map.h>
 #include <tvm/topi/broadcast.h>
 #include <tvm/topi/detail/broadcast.h>
 #include <tvm/topi/detail/constant_utils.h>
@@ -41,11 +43,101 @@
 #include <unordered_set>
 #include <vector>
 
+#include "tvm/ir/expr.h"
+#include "tvm/runtime/data_type.h"
+#include "tvm/tir/expr.h"
+#include "tvm/tir/op.h"
+#include "tvm/tir/var.h"
+
 namespace tvm {
 namespace topi {
 
 using namespace tvm::te;
 using namespace topi::detail;
+
+/*!
+ * \brief Creates an operation to slide a window over the input x.
+ *
+ * \param x The input tensor.
+ * \param axis What axis the window begins sliding over. Window will be slid
+ * over this axis and all following axes. The axis value determines the window
+ * shape (and thus, the number of strides): window shape and strides must both
+ * be of length `data.ndim-axis`.
+ * \param window_shape The window shape to form over the input. Window shape
+ * must be of length `data.ndim-axis`.
+ * \param strides How to stride the window along each dimension. Strides must be
+ * of length `data.ndim-axis`.
+ * \param name The name of the operation
+ * \param tag The tag to mark the operation
+ *
+ * \return A Tensor whose op member is the sliding_window operation
+ */
+inline Tensor sliding_window(const Tensor& x, int axis, Array<Integer> window_shape,
+                             Array<Integer> strides, std::string name = "T_sliding_window",
+                             std::string tag = "") {
+  CHECK_GE(axis, 0);
+  auto _axis = size_t(axis);
+  CHECK_LT(_axis, x->shape.size()) << "axis must be a valid dimension index of x.";
+  CHECK_EQ(x->shape.size() - _axis, window_shape.size())
+      << "There must be a window shape for every dimension of x "
+      << "over which we are sliding the window.";
+  CHECK_EQ(strides.size(), window_shape.size()) << "Windows and strides should be the same length.";
+
+  // Compute the new shape.
+  Array<PrimExpr> new_shape;
+  // Dimensions up until `axis` remain the same.
+  for (size_t i = 0; i < _axis; ++i) {
+    new_shape.push_back(x->shape[i]);
+  }
+
+  // New dimensions which result from sliding the window in each dimension. One new dimension per
+  // window dimension.
+  for (size_t i = 0; i < window_shape.size(); ++i) {
+    // Length of the shape along this dimension.
+    auto dim_len = x->shape[_axis + i];
+    // Length of the window along this dimension.
+    auto window_len = window_shape[i];
+    // Strides along this dimension.
+    auto stride = strides[i];
+
+    new_shape.push_back(floordiv(dim_len - (window_len - 1) + stride - 1, stride));
+  }
+
+  // Dimensions comprising the window.
+  for (size_t i = 0; i < window_shape.size(); ++i) {
+    new_shape.push_back(window_shape[i]);
+  }
+
+  ICHECK(new_shape.size() == _axis + 2 * window_shape.size());
+
+  return compute(
+      new_shape,
+      [&](const Array<Var>& indices) {
+        // The index at which to index the old tensor x.
+        Array<PrimExpr> idx;
+
+        // Dimensions up until `axis` remain the same.
+        for (size_t i = 0; i < _axis; ++i) {
+          idx.push_back(indices[i]);
+        }
+
+        for (size_t i = 0; i < window_shape.size(); ++i) {
+          // Which window in this dimension we are indexing.
+          auto window_idx = indices[_axis + i];
+          // Which index within the window we are indexing.
+          auto idx_within_window = indices[_axis + window_shape.size() + i];
+          // Stride value for this dimension.
+          auto stride = strides[i];
+
+          idx.push_back(window_idx * stride + idx_within_window);
+        }
+
+        ICHECK(idx.size() == x->shape.size());
+
+        return x(idx);
+      },
+      name, tag);
+}
 
 /*!
  * \brief Creates an operation to insert new dimensions of length 1
@@ -238,14 +330,11 @@ inline Tensor reshape(const Tensor& x, Array<PrimExpr> newshape, std::string nam
   Array<PrimExpr> target_shape;
 
   for (const auto& ele : newshape) {
-    if (ele.as<IntImmNode>()) {
-      target_shape.push_back(cast(DataType::Int(32), ele));
-    } else {
-      target_shape.push_back(ele);
-    }
+    target_shape.push_back(ele);
   }
 
-  if (is_empty_shape(target_shape)) {
+  // If either the input shape or the target shape contains a zero, return an empty tensor.
+  if (is_empty_shape(target_shape) || is_empty_shape(x->shape)) {
     return compute(
         target_shape, [&](const Array<Var>& indices) { return tvm::cast(x->dtype, 0); }, name, tag);
   } else {
@@ -310,7 +399,7 @@ inline Tensor unravel_index(const Tensor& x, const Tensor& shape, std::string na
  * The removed dimensions must have a constant size of 1.
  *
  * \param x The input tensor
- * \param axis Indices of the dimensions to remove. If this is empty,
+ * \param axis Indices of the dimensions to remove. If this is None,
  * all entries with a constant size of 1 will be removed.
  * \param atleast1d Whether the output need to be atleast1d.
  * \param name The name of the operation
@@ -322,7 +411,7 @@ inline Tensor squeeze(const Tensor& x, Array<Integer> axis, bool atleast1d = fal
                       std::string name = "T_squeeze", std::string tag = kInjective) {
   auto ndim = x->shape.size();
   std::vector<int> axis_val;
-  if (!axis.defined() || axis.size() == 0) {
+  if (!axis.defined()) {
     for (size_t i = 0; i < ndim; ++i) {
       if (IsConstInt(x->shape[i]) && GetConstInt(x->shape[i]) == 1) {
         axis_val.push_back(static_cast<int>(i));
@@ -506,7 +595,7 @@ inline Array<Tensor> split(const Tensor& x, Array<PrimExpr> split_indices, int a
     begin_ids.push_back(idx);
   }
 
-  Array<Array<PrimExpr> > out_shapes;
+  Array<Array<PrimExpr>> out_shapes;
   for (size_t i = 0; i < begin_ids.size(); ++i) {
     PrimExpr out_axis_size;
     if (i == begin_ids.size() - 1) {
@@ -550,14 +639,120 @@ inline Array<Tensor> split(const Tensor& x, Array<PrimExpr> split_indices, int a
   return result;
 }
 
+inline PrimExpr DynamicCanonicalizeIndex(PrimExpr index, PrimExpr extent, PrimExpr stride) {
+  auto idx_var = index.as<tvm::tir::VarNode>();
+  auto extent_var = extent.as<tvm::tir::VarNode>();
+
+  if (idx_var && extent_var && idx_var->name_hint == extent_var->name_hint) {
+    return index;
+  }
+
+  PrimExpr begin_range = tvm::if_then_else(stride < 0, -1, 0);
+  PrimExpr end_range = tvm::if_then_else(stride < 0, extent - 1, extent);
+
+  if (!(index->IsInstance<tvm::IntImmNode>() && GetConstInt(index) >= 0)) {
+    index = tvm::if_then_else(index < 0, index + extent, index);
+  }
+
+  return tvm::min(tvm::max(index, begin_range), end_range);
+}
+
+inline int64_t StaticCanonicalizeIndex(int64_t index, int64_t extent, int64_t stride) {
+  int64_t begin_range = stride < 0 ? -1 : 0;
+  int64_t end_range = stride < 0 ? extent - 1 : extent;
+  if (index < 0) {
+    index += extent;
+  }
+  return std::min(std::max(index, begin_range), end_range);
+}
+
+inline PrimExpr CanonicalizeIndex(PrimExpr index, PrimExpr extent, PrimExpr stride) {
+  if (index->IsInstance<tvm::IntImmNode>() && extent->IsInstance<tvm::IntImmNode>() &&
+      stride->IsInstance<tvm::IntImmNode>()) {
+    return tvm::IntImm(
+        tvm::DataType::Int(64),
+        StaticCanonicalizeIndex(GetConstInt(index), GetConstInt(extent), GetConstInt(stride)));
+  }
+  return DynamicCanonicalizeIndex(index, extent, stride);
+}
+
+inline PrimExpr GetLength(PrimExpr begin, PrimExpr end, PrimExpr stride, PrimExpr extent,
+                          bool assume_inbound = true) {
+  if (assume_inbound) {
+    return ceildiv(end - begin, stride);
+  } else {
+    begin = CanonicalizeIndex(begin, extent, stride);
+    end = CanonicalizeIndex(end, extent, stride);
+    return tvm::if_then_else(stride < 0, ceildiv(begin - end, -stride),
+                             ceildiv(end - begin, stride));
+  }
+}
+
 /*!
  * \brief strided_slice of a tensor where begin/end/stride can be mixed static and dynamic
  *
  * \param x The input tensor
  * \param begin The indices to begin with in the slicing
- * \param end Indicies indicating end of the slice
+ * \param end Indices indicating end of the slice
  * \param strides Specifies the stride values, it can be negative
  * in that case, the input tensor will be reversed in that particular axis
+ * \param axes Specifies which axes will be updated.
+ * \param assume_inbound Specifies if all indices are assumed to be inbound
+ * \param name The name of the operation
+ * \param tag The tag to mark the operation
+ *
+ * \return A Tensor whose op member is the dynamic_strided_slice operation
+ */
+inline Tensor dynamic_strided_slice_with_axes(
+    const Tensor& x, const Array<PrimExpr>& begin, const Array<PrimExpr>& end,
+    const Array<PrimExpr>& strides, const Array<Integer>& axes, bool assume_inbound = true,
+    std::string name = "T_dynamic_strided_slice_with_axes", std::string tag = kInjective) {
+  const size_t src_tensor_dim = x->shape.size();
+  ICHECK_EQ(begin.size(), end.size());
+  ICHECK_EQ(begin.size(), strides.size());
+  ICHECK_EQ(begin.size(), axes.size());
+  ICHECK_LE(begin.size(), src_tensor_dim);
+
+  for (const auto& axis_imm : axes) {
+    int axis = axis_imm->value;
+    ICHECK_LT(axis, src_tensor_dim);
+  }
+
+  arith::Analyzer analyzer;
+
+  Array<PrimExpr> out_shape = x->shape;
+  for (size_t i = 0; i < begin.size(); i++) {
+    int axis = axes[i]->value;
+    PrimExpr new_shape =
+        analyzer.Simplify(GetLength(begin[i], end[i], strides[i], out_shape[axis], assume_inbound));
+    out_shape.Set(axis, new_shape);
+  }
+
+  return te::compute(
+      out_shape,
+      [&](const Array<tvm::tir::Var>& indices) {
+        Array<PrimExpr> real_indices = indices.Map([](const auto& var) -> PrimExpr { return var; });
+
+        for (size_t i = 0; i < begin.size(); i++) {
+          int axis = axes[i]->value;
+          PrimExpr new_index = indices[axis] * strides[i] + begin[i];
+          real_indices.Set(axis, new_index);
+        }
+
+        return x(real_indices);
+      },
+      name, tag);
+}
+
+/*!
+ * \brief strided_slice of a tensor where begin/end/stride can be mixed static and dynamic
+ *
+ * \param x The input tensor
+ * \param begin The indices to begin with in the slicing
+ * \param end Indices indicating end of the slice
+ * \param strides Specifies the stride values, it can be negative
+ * in that case, the input tensor will be reversed in that particular axis
+ * \param assume_inbound Specifies if all indices are assumed to be inbound
  * \param name The name of the operation
  * \param tag The tag to mark the operation
  *
@@ -565,6 +760,7 @@ inline Array<Tensor> split(const Tensor& x, Array<PrimExpr> split_indices, int a
  */
 inline Tensor dynamic_strided_slice(const Tensor& x, const Array<PrimExpr>& begin,
                                     const Array<PrimExpr>& end, const Array<PrimExpr>& strides,
+                                    bool assume_inbound = true,
                                     std::string name = "T_dynamic_strided_slice",
                                     std::string tag = kInjective) {
   const size_t src_tensor_dim = x->shape.size();
@@ -577,11 +773,13 @@ inline Tensor dynamic_strided_slice(const Tensor& x, const Array<PrimExpr>& begi
   const size_t num_slice_axes = begin.size();
   Array<PrimExpr> out_shape;
 
+  arith::Analyzer analyzer;
   for (size_t i = 0; i < num_slice_axes; ++i) {
-    auto d = indexdiv(end[i] - begin[i], strides[i]);
-    if (d->IsInstance<tvm::IntImmNode>()) {
-      // Preserve static dimension if possible
-      out_shape.push_back(d);
+    // Check ProducerLoad to keep backward compatibility for Relay.
+    if (!begin[i]->IsInstance<ProducerLoadNode>() && !end[i]->IsInstance<ProducerLoadNode>() &&
+        !strides[i]->IsInstance<ProducerLoadNode>()) {
+      out_shape.push_back(
+          analyzer.Simplify(GetLength(begin[i], end[i], strides[i], x->shape[i], assume_inbound)));
     } else {
       out_shape.push_back(tvm::tir::Var("dim"));
     }
@@ -612,9 +810,10 @@ inline Tensor dynamic_strided_slice(const Tensor& x, const Array<PrimExpr>& begi
  *
  * \param x The input tensor
  * \param begin The indices to begin with in the slicing
- * \param end Indicies indicating end of the slice
+ * \param end Indices indicating end of the slice
  * \param strides Specifies the stride values, it can be negative
  * in that case, the input tensor will be reversed in that particular axis
+ * \param assume_inbound Specifies if all indices are assumed to be inbound
  * \param name The name of the operation
  * \param tag The tag to mark the operation
  *
@@ -622,28 +821,30 @@ inline Tensor dynamic_strided_slice(const Tensor& x, const Array<PrimExpr>& begi
  */
 inline te::Tensor dynamic_strided_slice(const te::Tensor& x, const te::Tensor& begin,
                                         const te::Tensor& end, const te::Tensor& strides,
+                                        bool assume_inbound = true,
                                         std::string name = "T_strided_slice_dynamic",
                                         std::string tag = topi::kInjective) {
+  DataType index_dtype = begin->shape[0]->dtype;
   const int64_t num_dynamic_axes = begin->shape[0].as<IntImmNode>()->value;
   ICHECK_EQ(end->shape[0].as<IntImmNode>()->value, num_dynamic_axes);
   ICHECK_EQ(strides->shape[0].as<IntImmNode>()->value, num_dynamic_axes);
 
   Array<PrimExpr> begin_expr, end_expr, strides_expr;
   for (int64_t i = 0; i < num_dynamic_axes; ++i) {
-    auto i64_ind = IntImm(DataType::Int(64), i);
-    begin_expr.push_back(begin(i64_ind));
-    end_expr.push_back(end(i64_ind));
-    strides_expr.push_back(strides(i64_ind));
+    auto ind = make_const(index_dtype, i);
+    begin_expr.push_back(begin(ind));
+    end_expr.push_back(end(ind));
+    strides_expr.push_back(strides(ind));
   }
-  return dynamic_strided_slice(x, begin_expr, end_expr, strides_expr, name, tag);
+  return dynamic_strided_slice(x, begin_expr, end_expr, strides_expr, assume_inbound, name, tag);
 }
 
 /*!
- * \brief Calcluate the output shape of strided_slice, the entry point for Relay type relation
+ * \brief Calculate the output shape of strided_slice, the entry point for Relay type relation
  *
  * \param ishape The input tensor shape
  * \param begin The indices to begin with in the slicing
- * \param end Indicies indicating end of the slice
+ * \param end Indices indicating end of the slice
  * \param strides Specifies the stride values, it can be negative
  * in that case, the input tensor will be reversed in that particular axis
  * \param axes Axes along which slicing is applied. When it is specified, the length of begin, end,
@@ -669,7 +870,7 @@ inline Array<PrimExpr> StridedSliceOutputShape(
  *
  * \param x The input tensor
  * \param begin The indices to begin with in the slicing
- * \param end Indicies indicating end of the slice
+ * \param end Indices indicating end of the slice
  * \param strides Specifies the stride values, it can be negative
  * in that case, the input tensor will be reversed in that particular axis
  * \param axes Axes along which slicing is applied. When it is specified, the length of begin, end,
@@ -704,8 +905,8 @@ inline Tensor strided_slice_with_axes(const Tensor& x, const Array<Integer>& beg
         for (size_t i = 0; i < out_shape.size(); ++i) real_indices.push_back(indices[i]);
         for (size_t i = 0; i < axes.size(); ++i) {
           auto stride = make_const(strides[i].dtype(), strides_vec[i]);
-          PrimExpr ind = indices[axes[i]] * stride + begin_expr[i];
-          real_indices.Set(axes[i], ind);
+          PrimExpr ind = indices[axes[i].IntValue()] * stride + begin_expr[i];
+          real_indices.Set(axes[i].IntValue(), ind);
         }
         return x(real_indices);
       },
@@ -717,7 +918,7 @@ inline Tensor strided_slice_with_axes(const Tensor& x, const Array<Integer>& beg
  *
  * \param x The input tensor
  * \param begin The indices to begin with in the slicing
- * \param end Indicies indicating end of the slice
+ * \param end Indices indicating end of the slice
  * \param strides Specifies the stride values, it can be negative
  * in that case, the input tensor will be reversed in that particular axis
  * \param slice_mode Specifies the slice mode
@@ -736,9 +937,10 @@ inline Tensor strided_slice(const Tensor& x, const Array<Integer>& begin, const 
   Array<Integer> end_full(end);
   Array<Integer> strides_full(strides);
 
-  const IntImm one = IntImm(DataType::Int(64), 1);
-  const IntImm zero = IntImm(DataType::Int(64), 0);
-  const IntImm max_range = IntImm(DataType::Int(64), std::numeric_limits<int64_t>::max());
+  DataType index_dtype = begin.size() > 0 ? begin[0]->dtype : DataType::Int(64);
+  const IntImm one = IntImm(index_dtype, 1);
+  const IntImm zero = IntImm(index_dtype, 0);
+  const IntImm max_range = Downcast<IntImm>(max_value(index_dtype));
 
   for (size_t i = strides.size(); i < src_tensor_dim; ++i) {
     strides_full.push_back(one);
@@ -804,7 +1006,6 @@ inline Array<Tensor> split_sections(const Tensor& x, int num_sections, int axis,
  * \param batch_dims The number of batch dimensions.
  * \param mode The mode of the operation.
  * \param name The name of the operation.
- * \param mode The mode of to handle out of bound indices.
  * \param tag The tag to mark the operation.
  *
  * \return A Tensor whose op member is the take operation
@@ -895,7 +1096,7 @@ inline Tensor sequence_mask(const Tensor& data, const Tensor& valid_length, doub
  *
  * \return A Tensor whose op member is the take operation
  */
-inline Tensor take(const Tensor& a, const Tensor& indices, int batch_dims, int axis,
+inline Tensor take(const Tensor& a, Variant<Tensor, PrimExpr> indices, int batch_dims, int axis,
                    std::string mode = "clip", std::string name = "T_take",
                    std::string tag = kInjective) {
   if (axis < 0) {
@@ -904,22 +1105,30 @@ inline Tensor take(const Tensor& a, const Tensor& indices, int batch_dims, int a
   ICHECK_GE(axis, 0) << "axis out of bounds";
   ICHECK_LT(axis, a->shape.size()) << "axis out of bounds";
   auto axis_dim = a->shape[axis];
-  int indices_len = static_cast<int>(indices->shape.size());
+  auto indices_shape = [&]() -> Array<PrimExpr> {
+    if (auto tensor = indices.as<TensorNode>()) {
+      return tensor->shape;
+    } else {
+      return {};
+    }
+  }();
+
+  int indices_len = static_cast<int>(indices_shape.size());
 
   int batch_dims_ = batch_dims;
   if (batch_dims_ != 0) {
-    ICHECK_GE(batch_dims_, -static_cast<int>(indices->shape.size())) << "batch_dims out of bounds";
-    ICHECK_LE(batch_dims_, indices->shape.size()) << "batch_dims out of bounds";
+    ICHECK_GE(batch_dims_, -indices_len) << "batch_dims out of bounds";
+    ICHECK_LE(batch_dims_, indices_len) << "batch_dims out of bounds";
 
     if (batch_dims_ < 0) {
-      batch_dims_ = indices->shape.size() + batch_dims_;
+      batch_dims_ = indices_len + batch_dims_;
     }
 
     ICHECK_LT(batch_dims_, a->shape.size()) << "batch_dims out of bounds";
     ICHECK_LE(batch_dims_, axis) << "batch_dims must be less than or equal to axis";
     for (int i = 0; i < batch_dims_; ++i) {
       auto addr1 = a->shape[i];
-      auto addr2 = indices->shape[i];
+      auto addr2 = indices_shape[i];
       auto v1 = static_cast<IntImm*>(&addr1)->get()->value;
       auto v2 = static_cast<IntImm*>(&addr2)->get()->value;
       ICHECK_EQ(v1, v2) << "a.shape[" << i << "] should be equal to indices.shape[" << i << "]";
@@ -936,12 +1145,23 @@ inline Tensor take(const Tensor& a, const Tensor& indices, int batch_dims, int a
   for (int i = batch_dims_; i < axis; ++i) {
     out_shape.push_back(a->shape[i]);
   }
-  for (size_t i = static_cast<size_t>(batch_dims_); i < indices->shape.size(); ++i) {
-    out_shape.push_back(indices->shape[i]);
+  for (int i = batch_dims_; i < indices_len; ++i) {
+    out_shape.push_back(indices_shape[i]);
   }
   for (size_t i = axis + 1; i < a->shape.size(); ++i) {
     out_shape.push_back(a->shape[i]);
   }
+
+  auto get_index = [&](const Array<PrimExpr>& indices_position) -> PrimExpr {
+    if (auto tensor = indices.as<Tensor>()) {
+      return tensor.value()(indices_position);
+    } else if (auto prim = indices.as<PrimExpr>()) {
+      ICHECK_EQ(indices_position.size(), 0);
+      return prim.value();
+    } else {
+      LOG(FATAL) << "Variant did not contain either allowed type";
+    }
+  };
 
   if (mode == "clip") {
     if (batch_dims_ == 0) {
@@ -956,7 +1176,7 @@ inline Tensor take(const Tensor& a, const Tensor& indices, int batch_dims, int a
             for (size_t j = 0; j < static_cast<size_t>(axis); ++j) {
               real_indices.push_back(out_index[j]);
             }
-            auto idx = tvm::min(tvm::max(0, indices(indices_position)), axis_dim - 1);
+            auto idx = tvm::min(tvm::max(0, get_index(indices_position)), axis_dim - 1);
             real_indices.push_back(idx);
             for (size_t j = axis + indices_len; j < out_index.size(); ++j) {
               real_indices.push_back(out_index[j]);
@@ -979,7 +1199,7 @@ inline Tensor take(const Tensor& a, const Tensor& indices, int batch_dims, int a
             for (size_t j = 0; j < static_cast<size_t>(axis); ++j) {
               real_indices.push_back(out_index[j]);
             }
-            auto idx = tvm::min(tvm::max(0, indices(indices_position)), axis_dim - 1);
+            auto idx = tvm::min(tvm::max(0, get_index(indices_position)), axis_dim - 1);
             real_indices.push_back(idx);
             for (size_t j = axis + indices_len - batch_dims_; j < out_index.size(); ++j) {
               real_indices.push_back(out_index[j]);
@@ -989,8 +1209,6 @@ inline Tensor take(const Tensor& a, const Tensor& indices, int batch_dims, int a
           name, tag);
     }
   } else if (mode == "fast") {
-    LOG(WARNING) << "Fast mode segfaults when there are out-of-bounds indices. "
-                    "Make sure input indices are in bound";
     return compute(
         out_shape,
         [&](const Array<Var>& out_index) {
@@ -1002,7 +1220,7 @@ inline Tensor take(const Tensor& a, const Tensor& indices, int batch_dims, int a
           for (size_t j = 0; j < static_cast<size_t>(axis); ++j) {
             real_indices.push_back(out_index[j]);
           }
-          real_indices.push_back(indices(indices_position));
+          real_indices.push_back(get_index(indices_position));
           for (size_t j = axis + indices_len; j < out_index.size(); ++j) {
             real_indices.push_back(out_index[j]);
           }
@@ -1021,7 +1239,7 @@ inline Tensor take(const Tensor& a, const Tensor& indices, int batch_dims, int a
           for (size_t j = 0; j < static_cast<size_t>(axis); ++j) {
             real_indices.push_back(out_index[j]);
           }
-          auto idx = truncmod(truncmod(indices(indices_position), axis_dim) + axis_dim, axis_dim);
+          auto idx = truncmod(truncmod(get_index(indices_position), axis_dim) + axis_dim, axis_dim);
           real_indices.push_back(idx);
           for (size_t j = axis + indices_len; j < out_index.size(); ++j) {
             real_indices.push_back(out_index[j]);
@@ -1237,7 +1455,7 @@ inline Tensor gather(const Tensor& data, int axis, const Tensor& indices,
     size_t indices_dim_i = static_cast<size_t>(GetConstInt(indices->shape[axis]));
     ICHECK_GE(indices_dim_i, 1);
   }
-  ICHECK(indices->dtype.is_int());
+  ICHECK(indices->dtype.is_int() || indices->dtype.is_uint());
 
   Array<PrimExpr> out_shape;
   for (size_t i = 0; i < ndim_i; ++i) {
@@ -1304,7 +1522,7 @@ inline Tensor gather_nd(const Tensor& data, const Tensor& indices, int batch_dim
         }
         for (size_t i = 0; i < indices_dim0; ++i) {
           indices_position.Set(0, make_const(DataType::Int(32), i));
-          if (indices->dtype.is_int()) {
+          if (indices->dtype.is_int() || indices->dtype.is_uint()) {
             real_indices.push_back(indices(indices_position));
           } else {
             real_indices.push_back(tvm::cast(tvm::DataType::Int(32), indices(indices_position)));
@@ -1382,10 +1600,11 @@ inline Tensor tensordot(const Tensor& A, const tvm::te::Tensor& B, int axes = 2,
     for (; it != input_indices.end(); ++it) B_indices.push_back(*it);
 
     // Some passes don't like reductions with empty axis, so avoid it here
-    if (iter_vars.empty())
+    if (iter_vars.empty()) {
       return A(A_indices) * B(B_indices);
-    else
+    } else {
       return sum(A(A_indices) * B(B_indices), iter_vars);
+    }
   };
 
   return compute(output_shape, func, name, tag);
@@ -1428,19 +1647,21 @@ inline Tensor tensordot(const Tensor& A, const tvm::te::Tensor& B, Array<PrimExp
     Array<PrimExpr> A_indices;
     for (unsigned i = 0; i < A->shape.size(); ++i) {
       auto axes_pos = std::find(A_axes_val.begin(), A_axes_val.end(), i);
-      if (axes_pos == A_axes_val.end())
+      if (axes_pos == A_axes_val.end()) {
         A_indices.push_back(input_indices[idx_input++]);
-      else
+      } else {
         A_indices.push_back(iter_vars[axes_pos - A_axes_val.begin()]);
+      }
     }
 
     Array<PrimExpr> B_indices;
     for (unsigned i = 0; i < B->shape.size(); ++i) {
       auto axes_pos = std::find(B_axes_val.begin(), B_axes_val.end(), i);
-      if (axes_pos == B_axes_val.end())
+      if (axes_pos == B_axes_val.end()) {
         B_indices.push_back(input_indices[idx_input++]);
-      else
+      } else {
         B_indices.push_back(iter_vars[axes_pos - B_axes_val.begin()]);
+      }
     }
     return sum(A(A_indices) * B(B_indices), iter_vars);
   };
@@ -1449,9 +1670,22 @@ inline Tensor tensordot(const Tensor& A, const tvm::te::Tensor& B, Array<PrimExp
 
 inline Tensor arange(const PrimExpr& start, const PrimExpr& stop, const PrimExpr& step,
                      DataType dtype, std::string name = "T_arange", std::string tag = kInjective) {
-  PrimExpr num_elem = tvm::cast(
-      tvm::DataType::Int(32), tvm::ceil(tvm::cast(tvm::DataType::Float(32), stop - start) / step));
-  Array<PrimExpr> shape;
+  arith::Analyzer analyzer;
+  PrimExpr num_elem;
+  bool is_all_int = start.dtype().is_int() && stop.dtype().is_int() && step.dtype().is_int();
+  if (is_all_int && analyzer.CanProveGreaterEqual(step, 1)) {
+    // fast path for integer arange when step is positive
+    num_elem = tvm::floordiv((stop - start + step - 1), step);
+  } else if (is_all_int && analyzer.CanProveLess(step, 0)) {
+    // fast path for integer arange when step is negative
+    num_elem = tvm::floordiv((start - stop - step - 1), -step);
+  } else {
+    // fallback path for non-integer or step of unknown sign
+    num_elem = tvm::cast(DefaultIndexType(),
+                         tvm::ceil(tvm::cast(tvm::DataType::Float(32), stop - start) / step));
+  }
+  num_elem = analyzer.Simplify(num_elem);
+
   return compute(
       {num_elem},
       [&](const Array<Var>& indices) { return tvm::cast(dtype, start + step * indices[0]); }, name,
@@ -1482,7 +1716,11 @@ inline Array<Tensor> meshgrid(const Array<Tensor>& inputs, const std::string& in
         out_shape,
         [&](const Array<Var>& indices) {
           const int src_index = (cartesian_indexing && i < 2) ? 1 - i : i;
-          Array<PrimExpr> real_indices = {indices[src_index]};
+          auto ndim = inputs[i]->GetShape().size();
+          Array<PrimExpr> real_indices = {};
+          if (ndim > 0) {
+            real_indices = {indices[src_index]};
+          }
           return inputs[i](real_indices);
         },
         name, tag));
@@ -1497,10 +1735,12 @@ inline Array<Tensor> meshgrid(const Array<Tensor>& inputs, const std::string& in
  * \param dst_layout the destination layout.
  * \param name output tensor name.
  * \param tag output tensor tag.
+ * \param schedule_rule name of specialized schedule rule to use.
  * \return A tensor with shape in \p dst_layout
  */
 inline Tensor layout_transform(const Tensor& src, const std::string& src_layout,
                                const std::string& dst_layout,
+                               const std::string schedule_rule = "None",
                                const std::string name = "T_layout_trans",
                                const std::string tag = kInjective) {
   Layout src_layout_struct(src_layout);
@@ -1519,14 +1759,24 @@ inline Tensor layout_transform(const Tensor& src, const std::string& src_layout,
 
   Array<PrimExpr> dst_shape = layout_converter.ForwardShape(src->shape);
 
+  Map<String, ObjectRef> attrs = {{"schedule_rule", String(schedule_rule)},
+                                  // Information about layouts needed for the schedule rule
+                                  {"src_layout", String(src_layout)},
+                                  {"dst_layout", String(dst_layout)},
+                                  {"input_shape", src->shape}};
+
   return compute(
       dst_shape,
       [&](const Array<Var>& dst_indices) {
         Array<PrimExpr> dst_indices_expr(dst_indices.begin(), dst_indices.end());
         Array<PrimExpr> src_indices = layout_converter.BackwardIndex(dst_indices_expr);
-        return src(src_indices);
+        PrimExpr in_range = PrimExpr(1) > PrimExpr(0);  // init with dtype=bool and value=true
+        for (size_t i = 0; i < src.ndim(); ++i) {
+          in_range = in_range && (src_indices[i] < src->shape[i]);
+        }
+        return if_then_else(in_range, src(src_indices), tvm::cast(src->dtype, PrimExpr(0)));
       },
-      name, tag);
+      name, tag, attrs);
 }
 
 /*! \brief Utility function for auto_scheduler_layout_transform */
@@ -1593,6 +1843,61 @@ inline Tensor auto_scheduler_layout_transform(const Tensor& src, const String& s
           src_indices.push_back(src_index);
         }
         return src(src_indices);
+      },
+      name, tag);
+}
+
+/*!
+ * \brief Transform the meta-schedule generated layout according to TIR's IndexMap
+ * \param src the source input.
+ * \param index_map The TIR IndexMap
+ * \param name output tensor name.
+ * \param tag output tensor tag.
+ * \return A tensor. The layout transformation method
+ * \note Example:
+ *
+ * For the indexing pattern below:
+ *
+ *  for i in range(32):
+ *    for j in range(64):
+ *      load A[
+ *        i / 16 *  4 + j / 16,
+ *        i % 16 * 16 + j % 16,
+ *      ]
+ *
+ *  The corresponding indexing pattern in TIR is:
+ *
+ *    A[i, j] => A'[i / 4, j / 16, i % 4, j % 16]
+ *
+ *  which converts the pattern to:
+ *
+ *  for i in range(32):
+ *    for j in range(64):
+ *      load A'[
+ *        i / 16 + j / 64,
+ *        i % 16,
+ *        j % 64 / 16,
+ *        j % 16,
+ *      ]
+ *
+ *  In this case, the transformation pattern is:
+ *    A'[a, b, c, d] = A[a * 4 + c, b * 16 + d]
+ */
+inline Tensor meta_schedule_layout_transform(const Tensor& src, const tir::IndexMap& index_map,
+                                             const String name = "T_meta_schedule_layout_trans",
+                                             const String tag = kInjective) {
+  arith::Analyzer analyzer;
+  Array<Range> iter_domain;
+  iter_domain.reserve(src->shape.size());
+  for (const PrimExpr& e : src->shape) {
+    iter_domain.push_back(Range::FromMinExtent(make_zero(e->dtype), e));
+  }
+  Array<PrimExpr> post_transform_shape = index_map->MapShape(src->shape, &analyzer);
+  return compute(
+      post_transform_shape,
+      [src, inv = index_map.Inverse(iter_domain, &analyzer),
+       &analyzer](const Array<Var>& indices) -> PrimExpr {
+        return src(inv->MapIndices(Array<PrimExpr>{indices.begin(), indices.end()}, &analyzer));
       },
       name, tag);
 }
@@ -1727,7 +2032,7 @@ inline Tensor sparse_to_dense(const Tensor& sparse_indices, const Array<PrimExpr
       [&](const Array<Var>& indices) {
         PrimExpr ret = default_value;
         if (0 == rank_sparse_indices) {
-          ret = if_then_else(indices[0] == sparse_indices[0], sparse_values[0], ret);
+          ret = if_then_else(indices[0] == sparse_indices(), sparse_values(), ret);
         } else if (1 == rank_sparse_indices) {
           for (int j = 0; j < GetConstInt(sparse_indices->shape[0]); j++) {
             ret = if_then_else(indices[0] == sparse_indices[j], sparse_values[j], ret);
@@ -1818,43 +2123,23 @@ inline Tensor matrix_set_diag(const Tensor& input, const Tensor& diagonal, int k
 inline Tensor adv_index(const Tensor& data, const Array<Tensor>& indices,
                         const std::string name = "advanced_index",
                         const std::string tag = kInjective) {
+  ICHECK_LE(indices.size(), data->shape.size()) << "too many indices for data!";
   Array<PrimExpr> oshape;
   Array<PrimExpr> broadcast_shape;
   Array<Tensor> bindices;
-  std::vector<int64_t> flatten_shape_lens;
-  int64_t num_picked_elems = 1;
-  bool has_dyn_shape = false;
 
+  broadcast_shape = indices[0]->shape;
+  for (size_t i = 1; i < indices.size(); ++i) {
+    auto bh = detail::BroadcastShape(broadcast_shape, indices[i]->shape);
+    broadcast_shape = Array<PrimExpr>(bh.common_shape.begin(), bh.common_shape.end());
+  }
   if (indices.size() == 1) {
-    broadcast_shape = indices[0]->shape;
+    // quick path
     bindices = indices;
   } else {
-    for (const auto& index : indices) {
-      int64_t flatten_len = 1;
-      for (const auto& dim : index->shape) {
-        const IntImmNode* axis_len = dim.as<IntImmNode>();
-        if (!axis_len) {
-          broadcast_shape = index->shape;
-          has_dyn_shape = true;
-          break;
-        }
-        flatten_len *= axis_len->value;
-      }
-      if (has_dyn_shape) break;
-      flatten_shape_lens.push_back(flatten_len);
-      if (flatten_len > num_picked_elems) {
-        num_picked_elems = flatten_len;
-        broadcast_shape = index->shape;
-      }
-    }
-
     // Do broadcast for indices
     for (size_t i = 0; i < indices.size(); ++i) {
-      if (!has_dyn_shape && flatten_shape_lens[i] < num_picked_elems) {
-        bindices.push_back(broadcast_to(indices[i], broadcast_shape));
-      } else {
-        bindices.push_back(indices[i]);
-      }
+      bindices.push_back(broadcast_to(indices[i], broadcast_shape));
     }
   }
 
@@ -1872,7 +2157,6 @@ inline Tensor adv_index(const Tensor& data, const Array<Tensor>& indices,
         for (size_t i = 0; i < broadcast_shape.size(); ++i) {
           tensor_indices.push_back(iter_var[i]);
         }
-
         Array<PrimExpr> real_indices;
         for (size_t i = 0; i < bindices.size(); ++i) {
           real_indices.push_back(bindices[i](tensor_indices));
@@ -1885,6 +2169,42 @@ inline Tensor adv_index(const Tensor& data, const Array<Tensor>& indices,
       },
       name, tag);
 }
+
+namespace relax {
+// relax dynamic slice
+inline te::Tensor dynamic_strided_slice(const te::Tensor& x, const te::Tensor& begin,
+                                        const te::Tensor& end, const te::Tensor& strides,
+                                        Array<PrimExpr> output_shape,
+                                        std::string name = "T_strided_slice_dynamic",
+                                        std::string tag = kInjective) {
+  const size_t num_dynamic_axes = x.ndim();
+  ICHECK_EQ(begin.ndim(), 1);
+  ICHECK_EQ(end.ndim(), 1);
+  ICHECK_EQ(strides.ndim(), 1);
+  const auto* len_begin = begin->shape[0].as<IntImmNode>();
+  const auto* len_end = end->shape[0].as<IntImmNode>();
+  const auto* len_strides = strides->shape[0].as<IntImmNode>();
+  ICHECK(len_begin);
+  ICHECK(len_end);
+  ICHECK(len_strides);
+  ICHECK_EQ(len_begin->value, num_dynamic_axes);
+  ICHECK_EQ(len_end->value, num_dynamic_axes);
+  ICHECK_EQ(len_strides->value, num_dynamic_axes);
+
+  return te::compute(
+      output_shape,
+      [&](const Array<tvm::tir::Var>& indices) {
+        Array<PrimExpr> real_indices;
+        for (size_t i = 0; i < num_dynamic_axes; ++i) {
+          auto ind = make_const(DataType::Int(64), i);
+          real_indices.push_back(indices[i] * strides(ind) + tvm::min(begin(ind), x->shape[i] - 1));
+        }
+        return x(real_indices);
+      },
+      name, tag);
+}
+
+}  // namespace relax
 
 }  // namespace topi
 }  // namespace tvm

@@ -27,8 +27,8 @@ import tvm.ir
 from tvm import relay, te
 from tvm.runtime import ndarray as _nd
 
-from . import _ffi_api
 from ..backend.utils import mangle_module_name
+from . import _ffi_api
 
 
 def build_config(opt_level=2, required_pass=None, disabled_pass=None, trace=None):
@@ -97,6 +97,25 @@ def InferType():
         The registered type inference pass.
     """
     return _ffi_api.InferType()
+
+
+def InferTypeLocal(expr):
+    """Infer the type of a single expr, reusing type information to do so.
+
+    This populates the checked_type field in expr. We assume existing type information
+    in the graph is correct!
+
+    Parameters
+    ----------
+    expr: relay.Expr
+        The expression we want to know the type of
+
+    Returns
+    -------
+    type: relay.Type
+        The type of the expression
+    """
+    return _ffi_api.InferTypeLocal(expr)
 
 
 def FoldScaleAxis():
@@ -242,7 +261,7 @@ def LazyGradientInit():
     return _ffi_api.LazyGradientInit()
 
 
-def FoldConstantExpr(expr, mod):
+def FoldConstantExpr(expr, mod, fold_qnn=False):
     """Fold the constant expressions in a Relay program.
     Parameters
     ----------
@@ -250,24 +269,37 @@ def FoldConstantExpr(expr, mod):
         The expression to fold
     mod: IRModule
         The module the expr lives in (for global calls)
+    fold_qnn: bool
+        Whether to fold constants for QNN operations.
 
     Returns
     -------
     new_expr: Expr
         The expr after Constant Folding
     """
-    return _ffi_api.FoldConstantExpr(expr, mod)
+    return _ffi_api.FoldConstantExpr(expr, mod, fold_qnn)
 
 
-def FoldConstant():
+def FoldConstant(fold_qnn=False):
     """Fold the constant expressions in a Relay program.
+
+    Because of backward compatibility reason it skips QNN primitives from folding by default.
+    There are some transformation passes like FakeQuantizationToInteger, which requires to keep QNN
+    primitives for constant subgraphs. Uncontrolled constant folding of QNN primitives may break
+    applicability of FakeQuantizationToInteger. We suggest to use FoldConstant pass with none
+    default fold_qnn=True value only when all other QNN sensitive passes were already applied.
+
+    Parameters
+    ----------
+    fold_qnn: bool
+        Whether to fold constants for QNN operations.
 
     Returns
     -------
     ret : tvm.transform.Pass
         The registered pass for constant folding.
     """
-    return _ffi_api.FoldConstant()
+    return _ffi_api.FoldConstant(fold_qnn)
 
 
 def FuseOps(fuse_opt_level=-1):
@@ -695,9 +727,22 @@ def LambdaLift():
     return _ffi_api.LambdaLift()
 
 
-def PartitionGraph(mod_name="default"):
+def PartitionGraph(mod_name="default", bind_constants=True):
     """Partition a Relay program into regions that can be executed on different
     backends.
+
+    Parameters
+    ----------
+    mod_name : string
+        Controls the prefix of the name of each partitioned subraph.
+        If `mod_name` is None, then `tvmgen_` prefix is used.
+        Otherwise, `tvmgen_mod_name_` prefix is used.
+
+    bind_constants: bool
+        Whether or not to bind constants in partitioned subgraphs. Note that the codegen needs
+        to maintain the bound constants; Otherwise the constants will be maintained by
+        the metadata module. So it is recommended for C-source based codegens to
+        set bind_constants=False to avoid embedding large constants in a C source file.
 
     Returns
     -------
@@ -705,7 +750,7 @@ def PartitionGraph(mod_name="default"):
         The registered pass that partitions the Relay program.
     """
     mod_name = mangle_module_name(mod_name)
-    return _ffi_api.PartitionGraph(mod_name)
+    return _ffi_api.PartitionGraph(mod_name, bind_constants)
 
 
 def AnnotateTarget(targets, include_non_call_ops=True):
@@ -1004,7 +1049,7 @@ def function_pass(pass_func=None, opt_level=None, name=None, required=None):
         info = tvm.transform.PassInfo(opt_level, fname, required)
         if inspect.isclass(pass_arg):
             return _wrap_class_function_pass(pass_arg, info)
-        if not isinstance(pass_arg, (types.FunctionType, types.LambdaType)):
+        if not callable(pass_arg):
             raise TypeError("pass_func must be a callable for Module pass")
         return _ffi_api.MakeFunctionPass(pass_arg, info)
 
@@ -1151,12 +1196,12 @@ def SimplifyExpr():
 
 def PlanDevices(config):
     """
-    Uses existing "on_device" and "device_copy" CallNodes to infer the SEScope on which
+    Uses existing "on_device" and "device_copy" calls to infer the virtual device on which
     every Relay sub-expression should run and the result stored. Captures the result of that
-    analysis using new "on_device" and "device_copy" CallNodes. Sub-expressions which are
-    not otherwise constrained are assigned to the default_primitive_se_scope. However data and
-    computations which must be hosted on a CPU (such as shapes and shape functions) use the
-    cpu_se_scope.
+    analysis using new "on_device" and "device_copy" calls. Sub-expressions which are
+    not otherwise constrained are assigned to the default primitive virtual device describe by
+    config. However data and computations which must be hosted on a CPU (such as shapes and
+    shape functions) use the host virtual device of the config.
 
     Parameters
     ----------
@@ -1169,6 +1214,14 @@ def PlanDevices(config):
         The pass.
     """
     return _ffi_api.PlanDevices(config)
+
+
+def ManifestLifetimes():
+    """
+    Manifest the lifetimes of variables after allocations have been manifested, by inserting kill
+    operations once variables become dead.
+    """
+    return _ffi_api.ManifestLifetimes()
 
 
 def FoldExplicitPadding():
@@ -1198,7 +1251,7 @@ def AnnotateSpans():
     return _ffi_api.AnnotateSpans()
 
 
-def FakeQuantizationToInteger():
+def FakeQuantizationToInteger(hard_fail=False, use_qat=False, optional_qnn_ops=None):
     # pylint: disable=anomalous-backslash-in-string
     """
     Find regions of the graph of the form
@@ -1220,12 +1273,71 @@ def FakeQuantizationToInteger():
 
     Rules for rewriting indivdual ops are in fake_quantization_to_integer.py
 
+    Parameters
+    ----------
+    hard_fail : boolean
+        How do deal with errors during graph rewriting.
+        If true, raise an error.
+        If false, skip rewriting the subgraph.
+
+    use_qat : boolean
+        To perform an additional QAT pass - convert enabled operations with dequantized inputs.
+        Example: in the graph above op2 is not registered with the FakeQuantizationToInteger
+        attribute, op1 operation can still be converted. Converted pattern below:
+
+        .. code-block:: text
+
+            x    w
+            |    |
+            \\   /
+              op1
+              |
+              dq
+              |
+              op2
+              |
+              q
+
+    optional_qnn_ops : List[str]
+        Specify a list of operator names to explicitly enable conversion for
+        specific ops disabled by default.
+        Example: ['nn.softmax']
+
     Returns
     -------
     ret : tvm.transform.Pass
-        The registered SimplifyExpr pass.
+        The registered FakeQuantizationToInteger pass.
     """
-    return _ffi_api.FakeQuantizationToInteger()
+    if optional_qnn_ops is None:
+        optional_qnn_ops = []
+    return _ffi_api.FakeQuantizationToInteger(hard_fail, use_qat, optional_qnn_ops)
+
+
+def FlattenAtrousConv():
+    # pylint: disable=anomalous-backslash-in-string
+    """
+    The purpose of this pass is to find a sequence of space_to_batch_nd-conv2d-batch_to_space_nd
+    operations:
+
+    .. code-block:: text
+
+      x     w
+      |     |
+      s2b   |
+       \\   /
+        conv2d
+         |
+         b2s
+
+    and convert them into subgraphs with a convolution with the modified "dilation" and
+    recalculated "padding" parameters.
+
+    Returns
+    -------
+    ret : tvm.transform.Pass
+        The registered FlattenAtrousConv pass.
+    """
+    return _ffi_api.FlattenAtrousConv()
 
 
 def ToMixedPrecision(mixed_precision_type="float16", missing_op_mode=1):
@@ -1244,6 +1356,13 @@ def ToMixedPrecision(mixed_precision_type="float16", missing_op_mode=1):
         1: Allow missing ops but emit warnings.
         2: Allow missing ops and silently ignore them.
 
+    relay.ToMixedPrecision.keep_orig_output_dtype: boolean
+      Defines if outputs should be retained in original data type or convert to
+      mixed_precision_type. By default this parameter is False and transformation
+      modifies the data types of outputs to mixed_precision_type.
+      This parameter is not part of explicit arguments of the transformation, but should
+      be passed through tvm.transform.PassContext.
+
     Returns
     -------
     ret : tvm.transform.Pass
@@ -1257,9 +1376,137 @@ def ToMixedPrecision(mixed_precision_type="float16", missing_op_mode=1):
 def SplitArgs(max_function_args):
     """Split function with huge number of arguments to smaller pieces.
 
+    Parameters
+    ----------
+    max_function_args: int
+      Maximum number of function arguments. If it equals 0 then SplitArgs
+      shouldn't split the function.
+
+
     Returns
     -------
     ret : tvm.transform.Pass
-        The registered pass for constant folding.
+        The registered pass.
     """
     return _ffi_api.SplitArgs(max_function_args)
+
+
+def OutlineCompilerFunctionsWithExistingGlobalSymbols(compiler_filter=""):
+    """Outlines all literal functions in direct call positions which have a "Compiler"
+    attribute.
+
+    The outlined functions are bound to unique global vars according to their existing
+    "global_symbol" attribute. At most one function with the same global symbol is outlined.
+
+    If compiler_filter is non-empty only functions with that as their attribute value are
+    outlined.
+
+    This pass may be useful for external codegen using the "RelayToTIR" custom pass mechanism
+    to prepare the IRModule before custom lowering.
+
+    Parameters
+    ----------
+    compiler_filter : String
+        If non-empty, the "Compiler" attribute to filter on.
+
+    Returns
+    -------
+    ret : tvm.transform.Pass
+        The pass.
+    """
+    return _ffi_api.OutlineCompilerFunctionsWithExistingGlobalSymbols(compiler_filter)
+
+
+def MarkCompilerFunctionsAsExtern(compiler_filter=""):
+    """Marks all global functions which have a "Compiler" attribute matching
+    compiler_filter as 'extern'.
+
+    The function's attributes are replaced with a single "Extern" attribute, and
+    all calls to the function are switched to use the 'call_lowered' calling convention.
+
+    If compiler_filter is non-empty only functions with that as their attribute value are
+    outlined.
+
+    This pass may be useful for external codegen using the "RelayToTIR" custom pass mechanism to
+    cleanup the IRModule after custom lowering.
+
+    Parameters
+    ----------
+    compiler_filter : String
+        If non-empty, the "Compiler" attribute to filter on.
+
+    Returns
+    -------
+    ret : tvm.transform.Pass
+        The pass.
+    """
+    return _ffi_api.MarkCompilerFunctionsAsExtern(compiler_filter)
+
+
+def CapturePostDfsIndexInSpans():
+    """Captures the post-dfs index and dominator post-dfs index of (most) expression nodes in
+    their span, in the form "index:<post-dfs index>:<dominator post-dfs index>".
+
+    This is useful for debugging since a) it helps identify pretty-printed sub-expressions within
+    the overall model and b) the indexes are heavily used by Collage for its compact representation
+    of sub-graphs.
+
+    Note that Op and Constructor nodes are not changed even though they are assigned an
+    post-dfs index.
+
+    Returns
+    -------
+    ret : tvm.transform.Pass
+        The pass.
+    """
+    return _ffi_api.CapturePostDfsIndexInSpans()
+
+
+def InlineCompilerFunctionsBoundTo(global_vars):
+    """Inlines all global functions bound to a global var in global_vars.
+
+    Both the global "Compiler" attributed function, and any calls to "Composite" functions it its
+    body are inlined.
+
+    This pass may be useful for external codegen which needs to undo partitioning based on
+    properties of the entire partition.
+
+    Parameters
+    ----------
+    global_vars : Array[tvm.relay.GlobalVar]
+        The global vars of all 'Compiler' functions to inline.
+
+    Returns
+    -------
+    ret : tvm.transform.Pass
+        The pass.
+    """
+    return _ffi_api.InlineCompilerFunctionsBoundTo(global_vars)
+
+
+def CollagePartition(config, cost_estimator=None):
+    """Partition the bodies of all functions according to the available targets so as to
+    minimize model latency. See https://github.com/apache/tvm-rfcs/blob/main/rfcs/0062-collage.md.
+
+    Parameters
+    ----------
+    config : CompilationConfig
+        The available targets.
+    cost_estimator : CostEstimator, optional
+        The custom cost estimator to use for costing each candidate partition.
+
+    Returns
+    -------
+    ret : tvm.transform.Pass
+        The pass.
+
+    """
+    if cost_estimator is None:
+        cost_estimator = relay.collage.CostEstimator()
+
+    return _ffi_api.CollagePartition(config, cost_estimator)
+
+
+def DivToMul():
+    """Transform division by a constant to multiplication by the inverse of the constant"""
+    return _ffi_api.DivToMul()

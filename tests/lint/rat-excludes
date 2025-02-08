@@ -20,9 +20,6 @@
 .*\.interp
 .*\.tokens
 
-# microTVM test data files
-testdata
-
 # Generated modules
 .*\.egg-info
 .*gen_modules
@@ -51,3 +48,7 @@ MANIFEST
 .bash_history
 rat-excludes
 Cargo.lock
+poetry.lock
+
+# Template files for Jenkins
+.*\.groovy\.j2

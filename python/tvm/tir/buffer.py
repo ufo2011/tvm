@@ -16,16 +16,17 @@
 # under the License.
 """Abstraction for array data structures."""
 from numbers import Integral
-import tvm._ffi
 
+import tvm._ffi
 from tvm._ffi.base import string_types
-from tvm.runtime import Object, convert
-from tvm.ir import PrimExpr, PointerType, PrimType
+from tvm.ir import PointerType, PrimExpr, PrimType, Range
+from tvm.runtime import Object, Scriptable, convert
+
 from . import _ffi_api
 
 
 @tvm._ffi.register_object("tir.Buffer")
-class Buffer(Object):
+class Buffer(Object, Scriptable):
     """Symbolic data buffer in TVM.
 
     Buffer provide a way to represent data layout
@@ -42,7 +43,7 @@ class Buffer(Object):
     READ = 1
     WRITE = 2
 
-    def access_ptr(self, access_mask, ptr_type="handle", content_lanes=1, offset=0):
+    def access_ptr(self, access_mask, ptr_type="handle", content_lanes=1, offset=0, extent=None):
         """Get an access pointer to the head of buffer.
 
         This is the recommended method to get buffer data
@@ -66,6 +67,9 @@ class Buffer(Object):
             The offset of pointer. We can use it to offset by
             the number of elements from the address of ptr.
 
+        extent: Expr, optional
+            The extent of pointer.
+
         Examples
         --------
         .. code-block:: python
@@ -78,6 +82,8 @@ class Buffer(Object):
           buffer.access_ptr("rw")
           # Get access ptr for read with offset
           buffer.access_ptr("r", offset = 100)
+          # Get access ptr for read with extent
+          buffer.access_ptr("r", extent = 100)
         """
         if isinstance(access_mask, string_types):
             mask = 0
@@ -87,14 +93,15 @@ class Buffer(Object):
                 elif value == "w":
                     mask = mask | Buffer.WRITE
                 else:
-                    raise ValueError("Unknown access_mask %s" % access_mask)
+                    raise ValueError(f"Unknown access_mask {access_mask}")
             access_mask = mask
         offset = convert(offset)
+        extent = convert(extent)
         return _ffi_api.BufferAccessPtr(
-            self, access_mask, ptr_type, content_lanes, offset  # type: ignore
+            self, access_mask, ptr_type, content_lanes, offset, extent  # type: ignore
         )
 
-    def vload(self, begin, dtype=None):
+    def vload(self, begin, dtype=None, predicate=None):
         """Generate an Expr that loads dtype from begin index.
 
         Parameters
@@ -106,6 +113,10 @@ class Buffer(Object):
             The data type to be loaded,
             can be vector type which have lanes that is multiple of Buffer.dtype
 
+        predicate : Optional[PrimExpr]
+            A vector mask of boolean values indicating which lanes of a vector are to be
+            loaded. The number lanes of the mask must be equal to the number of lanes being loaded.
+
         Returns
         -------
         load : Expr
@@ -113,9 +124,9 @@ class Buffer(Object):
         """
         begin = (begin,) if isinstance(begin, (int, PrimExpr)) else begin
         dtype = dtype if dtype else self.dtype
-        return _ffi_api.BufferVLoad(self, begin, dtype)  # type: ignore
+        return _ffi_api.BufferVLoad(self, begin, dtype, predicate)  # type: ignore
 
-    def vstore(self, begin, value):
+    def vstore(self, begin, value, predicate=None):
         """Generate a Stmt that store value into begin index.
 
         Parameters
@@ -126,13 +137,18 @@ class Buffer(Object):
         value : Expr
             The value to be stored.
 
+        predicate : Optional[PrimExpr]
+            A vector mask of boolean values indicating which lanes of a vector are to be
+            stored. The number lanes of the mask must be equal to the number of lanes in
+            value.
+
         Returns
         -------
         store : Stmt
             The corresponding store stmt.
         """
         begin = (begin,) if isinstance(begin, (int, PrimExpr)) else begin
-        return _ffi_api.BufferVStore(self, begin, value)  # type: ignore
+        return _ffi_api.BufferVStore(self, begin, value, predicate)  # type: ignore
 
     def scope(self):
         """Return the storage scope associated with this buffer.
@@ -142,6 +158,76 @@ class Buffer(Object):
             The storage scope associated with this buffer.
         """
         return _ffi_api.BufferStorageScope(self)  # type: ignore
+
+    def get_flattened_buffer(self):
+        """Generate a Buffer that is a flattened version of this buffer.
+
+        Returns
+        -------
+        flattened : Buffer
+            The corresponding flat buffer.
+        """
+        return _ffi_api.BufferGetFlattenedBuffer(self)  # type: ignore
+
+    def offset_of(self, indices):
+        """Determine the offset of the provided indices in the flattened buffer.
+
+        Parameters
+        ----------
+        indices : Union[PrimExpr, List[PrimExpr]]
+
+            The indices of the element in the original buffer.
+
+        Returns
+        -------
+        flattened_indices: List[PrimExpr]
+
+            The offset indices of the element in the flattened buffer.
+        """
+        return _ffi_api.BufferOffsetOf(self, indices)  # type: ignore
+
+    def __getitem__(self, indices):
+        from ..arith import Analyzer  # pylint: disable=import-outside-toplevel
+        from .expr import BufferLoad, Ramp, const  # pylint: disable=import-outside-toplevel
+        from .stmt import BufferRegion  # pylint: disable=import-outside-toplevel
+
+        if not isinstance(indices, (tuple, list)):
+            indices = [indices]
+        has_slice = any(isinstance(i, slice) for i in indices)
+        has_step = any(isinstance(i, slice) and i.step is not None for i in indices)
+        analyzer = Analyzer()
+        if has_slice and not has_step:
+            region = []
+            for i, index in enumerate(indices):
+                if isinstance(index, slice):
+                    start = 0 if index.start is None else index.start
+                    stop = self.shape[i] if index.stop is None else index.stop
+                    region.append(Range.from_min_extent(start, analyzer.simplify(stop - start)))
+                else:
+                    region.append(
+                        Range.from_min_extent(
+                            index, const(1, index.dtype) if isinstance(index, PrimExpr) else 1
+                        )
+                    )
+            return BufferRegion(self, region)
+        else:
+            expr_indices = []
+            for i, index in enumerate(indices):
+                if isinstance(index, slice):
+                    start = 0 if index.start is None else index.start
+                    stop = self.shape[i] if index.stop is None else index.stop
+                    step = 1 if index.step is None else index.step
+                    # We should ensure the dtype of start is the same with that of step.
+                    if isinstance(start, tvm.tir.expr.PrimExpr) and isinstance(step, int):
+                        step = tvm.tir.expr.IntImm(start.dtype, step)
+                    lanes = analyzer.simplify((stop - start + step - 1) // step)
+                    if lanes == 1:
+                        expr_indices.append(start)
+                    else:
+                        expr_indices.append(Ramp(start, step, int(lanes)))
+                else:
+                    expr_indices.append(index)
+            return BufferLoad(self, expr_indices)
 
 
 def decl_buffer(
@@ -155,6 +241,7 @@ def decl_buffer(
     data_alignment=-1,
     offset_factor=0,
     buffer_type="",
+    axis_separators=None,
     span=None,
 ):
     """Declare a new symbolic buffer.
@@ -175,7 +262,7 @@ def decl_buffer(
     name : str, optional
         The name of the buffer.
 
-    data : Var, optional
+    data : tir.Var, optional
         The data pointer in the buffer.
 
     strides: array of Expr
@@ -203,6 +290,11 @@ def decl_buffer(
         auto_broadcast buffer allows one to implement broadcast computation
         without considering whether dimension size equals to one.
         TVM maps buffer[i][j][k] -> buffer[i][0][k] if dimension j's shape equals 1.
+
+    axis_separators : list of int, optional
+        If passed, a list of separators between groups of axes,
+        each of which is flattened to an output axis.  For flat
+        memory spaces, should either be None, or an empty list.
 
     span: Optional[Span]
         The location of the decl_buffer creation in the source.
@@ -254,9 +346,13 @@ def decl_buffer(
     shape = (shape,) if isinstance(shape, (PrimExpr, Integral)) else shape
     dtype = "float32" if dtype is None else dtype
     strides = () if strides is None else strides
+
+    if axis_separators is None:
+        axis_separators = []
+
     if offset_factor != 0 and elem_offset is None:
         shape_dtype = shape[0].dtype if shape and hasattr(shape[0], "dtype") else "int32"
-        elem_offset = Var("%s_elem_offset" % name, shape_dtype)
+        elem_offset = Var(f"{name}_elem_offset", shape_dtype)
     if data is None:
         # Bool is represented as uint1 in the IR, but stored as int8
         storage_type = PrimType(dtype)
@@ -272,6 +368,7 @@ def decl_buffer(
         data_alignment,
         offset_factor,
         buffer_type,
+        axis_separators,
         span,
     )
 

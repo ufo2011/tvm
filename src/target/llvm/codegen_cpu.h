@@ -24,6 +24,8 @@
 #ifndef TVM_TARGET_LLVM_CODEGEN_CPU_H_
 #define TVM_TARGET_LLVM_CODEGEN_CPU_H_
 
+#ifdef TVM_LLVM_VERSION
+
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -32,15 +34,40 @@
 
 #include "codegen_llvm.h"
 
+namespace llvm {
+class BasicBlock;
+class Constant;
+class DIBuilder;
+class DIType;
+class Function;
+class FunctionType;
+class GlobalVariable;
+class LLVMContext;
+class MDNode;
+class StructType;
+class TargetMachine;
+class Type;
+class Value;
+
+// Used in std::unique_ptr
+class Module;
+}  // namespace llvm
+
 namespace tvm {
 namespace codegen {
+
+class LLVMTarget;
 
 // CPU host code generation
 class CodeGenCPU : public CodeGenLLVM {
  public:
-  void Init(const std::string& module_name, llvm::TargetMachine* tm, llvm::LLVMContext* ctx,
-            bool system_lib, bool dynamic_lookup, bool target_c_runtime) override;
-  void AddFunction(const PrimFunc& f) override;
+  CodeGenCPU();
+  virtual ~CodeGenCPU();
+
+  void Init(const std::string& module_name, LLVMTarget* llvm_target,
+            Optional<String> system_lib_prefix, bool dynamic_lookup,
+            bool target_c_runtime) override;
+  void AddFunction(const GlobalVar& gvar, const PrimFunc& f) override;
   void AddMainFunction(const std::string& entry_func_name) override;
   std::unique_ptr<llvm::Module> Finish() override;
   void VisitStmt_(const AssertStmtNode* op) override;
@@ -55,6 +82,12 @@ class CodeGenCPU : public CodeGenLLVM {
    * \param func_names List of functions to be included, in order.
    */
   void DefineFunctionRegistry(Array<String> func_names);
+
+  /*!
+   * \brief Serialize the metadata object as data, and implement get_c_metadata function.
+   * \param metadata The metadata which should be serialized.
+   */
+  void DefineMetadata(runtime::metadata::Metadata metadata);
 
  protected:
   void AddStartupFunction() final;
@@ -105,7 +138,8 @@ class CodeGenCPU : public CodeGenLLVM {
   llvm::Value* RuntimeTVMParallelBarrier();
   llvm::Value* CreateStaticHandle();
   llvm::Value* GetPackedFuncHandle(const std::string& str);
-  TypedPointer PackClosureData(const Array<Var>& fields, uint64_t* num_bytes);
+  TypedPointer PackClosureData(const Array<Var>& fields, uint64_t* num_bytes,
+                               std::string struct_name = "");
   TypedPointer CreateStructRefPtr(DataType t, llvm::Value* buffer, llvm::Value* index, int kind);
   void UnpackClosureData(TypedPointer cdata, const Array<Var>& fields,
                          std::unordered_map<const VarNode*, llvm::Value*>* vmap);
@@ -116,21 +150,26 @@ class CodeGenCPU : public CodeGenLLVM {
     llvm::BasicBlock* end_block;
   };
   PackedCall MakeCallPackedLowered(const Array<PrimExpr>& args, const DataType& r_type,
-                                   const int64_t begin, const int64_t end);
+                                   const int64_t begin, const int64_t end, bool use_string_lookup);
   // create call into tvm packed function.
-  llvm::Value* CreateCallPacked(const CallNode* op);
+  llvm::Value* CreateCallPacked(const CallNode* op, bool use_string_lookup);
   // Create trace call into tvm packed function.
   llvm::Value* CreateCallTracePacked(const CallNode* op);
   // Create static initialization
   void CreateStaticInit(const std::string& init_fname, const Stmt& body);
   // Create parallel launch
-  void CreateParallelLaunch(const Stmt& body, int num_task);
+  void CreateParallelLaunch(const Stmt& body, int num_task, std::string name = "");
   // Create a new compute scope.
   void CreateComputeScope(const AttrStmtNode* op);
   // Check if the call to packed function is successful
   // if not directly finalize function and pass on return code.
   // return the end block after the check
   llvm::BasicBlock* CheckCallSuccess(llvm::Value* retcode);
+
+  llvm::DISubprogram* CreateDebugFunction(const GlobalVar& gvar, const PrimFunc& f);
+  llvm::DISubprogram* CreateDebugFunction(llvm::StringRef name, const Array<Type>& param_types,
+                                          const Type& return_type);
+
   // Context for injection lookup
   llvm::GlobalVariable* gv_mod_ctx_{nullptr};
   llvm::GlobalVariable* gv_tvm_func_call_{nullptr};
@@ -154,19 +193,15 @@ class CodeGenCPU : public CodeGenLLVM {
   std::vector<std::pair<std::string, llvm::Constant*>> export_system_symbols_;
   // List of functions to be registered in the FuncRegistry, if generated.
   std::vector<std::pair<std::string, llvm::Function*>> registry_functions_;
-  // internal debug information, to be populated by
-  std::unique_ptr<DebugInfo> dbg_info_;
-  bool target_c_runtime_;
-  bool is_system_lib_;
 
-  // Get the DWARF type corresponding to the LLVM type |ty|. The current API in practice only
-  // generates |int32|, and |int8*|.
-  static llvm::DIType* getDebugType(IRBuilder* builder, llvm::DIBuilder* di_builder,
-                                    llvm::Type* ty);
-  // Adds the DWARF debug information for |function| to |dbg_info_|.
-  void AddDebugInformation(llvm::Function* function);
+  bool target_c_runtime_;
+  // The system lib prefix if it is not nullopt, then we should do
+  // system lib registration with the given prefix. The prefix can be ""
+  Optional<String> system_lib_prefix_;
 };
 
 }  // namespace codegen
 }  // namespace tvm
+
+#endif  // TVM_LLVM_VERSION
 #endif  // TVM_TARGET_LLVM_CODEGEN_CPU_H_
